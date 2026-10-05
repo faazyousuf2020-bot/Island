@@ -64,13 +64,21 @@ class MainActivity : Activity() {
         root.addView(switch("Show island", Prefs.ON, true))
         root.addView(switch("Notification popups", Prefs.NOTIF, true))
         root.addView(switch("Charging animation", Prefs.CHARGE, true))
+        root.addView(switch("Spinning ring when camera is in use", Prefs.CAMRING, true))
         root.addView(switch("Googly eyes when idle 👀", Prefs.EYES, false))
 
         root.addView(header("Fit it to your camera"))
         root.addView(slider("Width", Prefs.W, 50, 240, 96))
         root.addView(slider("Height", Prefs.H, 18, 60, 30))
-        root.addView(slider("Move down", Prefs.Y, 0, 60, 6))
-        root.addView(slider("Move left / right", Prefs.X, 0, 100, 50))
+        root.addView(text("The pill snaps to your camera automatically. Use these only for small tweaks.", 13f, grey))
+        val dyBar = slider("Fine-tune up / down", Prefs.DY, 0, 60, 30)
+        val dxBar = slider("Fine-tune left / right", Prefs.DX, 0, 100, 50)
+        root.addView(dyBar)
+        root.addView(dxBar)
+        root.addView(button("Reset size & position") {
+            prefs.edit().remove(Prefs.W).remove(Prefs.H).remove(Prefs.DY).remove(Prefs.DX).apply()
+            recreate()
+        })
         root.addView(button("Test a popup") {
             val sink = IslandBus.onNotification
             if (sink == null) {
@@ -90,6 +98,7 @@ class MainActivity : Activity() {
                     "• Playing music → album art + dancing bars; tap for controls\n" +
                     "• Swipe sideways in big view → music ↔ controls\n" +
                     "• Swipe down on pill → open  •  Swipe up → close\n" +
+                    "• Any app using the camera → green ring spins around it\n" +
                     "• Double-tap pill → eyes on/off\n" +
                     "• Long-press pill → this screen\n" +
                     "• Tap a notification popup → opens it\n" +

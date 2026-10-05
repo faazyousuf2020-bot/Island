@@ -19,8 +19,9 @@ object Prefs {
     const val EYES = "eyes"
     const val W = "w"
     const val H = "h"
-    const val Y = "y"
-    const val X = "x"
+    const val DY = "dy"   // fine-tune up/down around the camera (center = 30)
+    const val DX = "dx"   // fine-tune left/right around the camera (center = 50)
+    const val CAMRING = "camring"
 }
 
 fun Drawable.toBmp(size: Int): Bitmap {

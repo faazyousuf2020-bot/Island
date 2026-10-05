@@ -10,6 +10,9 @@ import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.content.res.Configuration
 import android.graphics.PixelFormat
+import android.graphics.Rect
+import android.util.DisplayMetrics
+import kotlin.math.max
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.media.MediaMetadata
@@ -106,6 +109,7 @@ class IslandService : AccessibilityService(), IslandView.Host {
         try { unregisterReceiver(screenRx) } catch (e: Exception) {}
         try { prefs.unregisterOnSharedPreferenceChangeListener(prefListener) } catch (e: Exception) {}
         try { cam.unregisterTorchCallback(torchCb) } catch (e: Exception) {}
+        try { cam.unregisterAvailabilityCallback(camAvail) } catch (e: Exception) {}
         try { msm?.removeOnActiveSessionsChangedListener(sessionsListener) } catch (e: Exception) {}
         controller?.unregisterCallback(mcCallback)
         try { wm.removeView(view) } catch (e: Exception) {}
@@ -125,11 +129,40 @@ class IslandService : AccessibilityService(), IslandView.Host {
 
     private fun applyPrefs(update: Boolean) {
         val d = resources.displayMetrics.density
-        view.baseW = prefs.getInt(Prefs.W, 96) * d
-        view.baseH = prefs.getInt(Prefs.H, 30) * d
-        lp.y = (prefs.getInt(Prefs.Y, 6) * d).toInt()
-        lp.x = ((prefs.getInt(Prefs.X, 50) - 50) * d).toInt()
+        val dx = (prefs.getInt(Prefs.DX, 50) - 50) * d
+        val dy = (prefs.getInt(Prefs.DY, 30) - 30) * d
+        var bw = prefs.getInt(Prefs.W, 96) * d
+        var bh = prefs.getInt(Prefs.H, 30) * d
+
+        // Find the real camera hole and center the pill on it
+        val screenW = realScreenWidth()
+        val cut = cameraCutout()
+        val camCx: Float
+        val camCy: Float
+        val camR: Float
+        if (cut != null) {
+            camCx = cut.exactCenterX()
+            camCy = cut.exactCenterY()
+            camR = max(cut.width(), cut.height()) / 2f
+            bh = max(bh, camR * 2 + 10 * d)   // always taller than the hole
+            bw = max(bw, camR * 2 + 44 * d)   // always wider than the hole
+        } else {
+            camCx = screenW / 2f
+            camCy = 6 * d + bh / 2f
+            camR = 7 * d
+        }
+        lp.x = (camCx - screenW / 2f + dx).toInt()
+        lp.y = (camCy - bh / 2f + dy).toInt()
+        view.baseW = bw
+        view.baseH = bh
+        // camera position inside the island window (window is centered on camCx + dx)
+        view.camDx = -dx
+        view.camY = camCy - lp.y
+        view.camR = camR
+
         view.eyes = prefs.getBoolean(Prefs.EYES, false)
+        camRingOn = prefs.getBoolean(Prefs.CAMRING, true)
+        view.camInUse = camRingOn && busyCams.isNotEmpty()
         notifOn = prefs.getBoolean(Prefs.NOTIF, true)
         chargeOn = prefs.getBoolean(Prefs.CHARGE, true)
         val landscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
@@ -262,7 +295,53 @@ class IslandService : AccessibilityService(), IslandView.Host {
         }
     }
 
+    // camera-in-use ring
+    private var camRingOn = true
+    private val busyCams = HashSet<String>()
+    private val camAvail = object : CameraManager.AvailabilityCallback() {
+        override fun onCameraAvailable(cameraId: String) {
+            busyCams.remove(cameraId)
+            updateCamRing()
+        }
+
+        override fun onCameraUnavailable(cameraId: String) {
+            busyCams.add(cameraId)
+            updateCamRing()
+        }
+    }
+
+    private fun updateCamRing() {
+        if (!ready) return
+        view.camInUse = camRingOn && busyCams.isNotEmpty()
+        view.refresh()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun cameraCutout(): Rect? {
+        if (Build.VERSION.SDK_INT < 29) return null
+        return try {
+            val dc = wm.defaultDisplay.cutout ?: return null
+            val h = resources.displayMetrics.heightPixels
+            dc.boundingRects.filter { it.top < h / 4 && !it.isEmpty }.minByOrNull { it.top }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun realScreenWidth(): Int = try {
+        val dm = DisplayMetrics()
+        wm.defaultDisplay.getRealMetrics(dm)
+        dm.widthPixels
+    } catch (e: Exception) {
+        resources.displayMetrics.widthPixels
+    }
+
     private fun setupTorch() {
+        try {
+            cam.registerAvailabilityCallback(camAvail, handler)
+        } catch (e: Exception) {
+        }
         try {
             torchId = cam.cameraIdList.firstOrNull {
                 cam.getCameraCharacteristics(it).get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true

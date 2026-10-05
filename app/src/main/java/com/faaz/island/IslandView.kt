@@ -74,6 +74,16 @@ class IslandView(context: Context, private val host: Host) : View(context) {
     var timerTotal = 0L
     var media: MediaInfo? = null
     var eyes = false
+    var camDx = 0f          // camera center relative to window center (x)
+    var camY = dp(15f)      // camera center from window top (y)
+    var camR = dp(7f)       // camera hole radius
+    var camInUse = false
+        set(value) {
+            if (field != value) camRingStart = SystemClock.uptimeMillis()
+            field = value
+            startTicking()
+        }
+    private var camRingStart = 0L
     var paused = false
         set(value) {
             field = value
@@ -258,7 +268,7 @@ class IslandView(context: Context, private val host: Host) : View(context) {
 
     private fun needsFrames(): Boolean {
         if (paused || !isAttachedToWindow || visibility != VISIBLE) return false
-        return (eyes && mode == Mode.IDLE) || mode == Mode.EXPANDED || mode == Mode.ALERT ||
+        return (eyes && mode == Mode.IDLE) || mode == Mode.EXPANDED || mode == Mode.ALERT || camInUse ||
                 hasLive() || timerEnd != 0L
     }
 
@@ -319,6 +329,7 @@ class IslandView(context: Context, private val host: Host) : View(context) {
 
         c.saveLayerAlpha(rect, (contentAlpha * 255).toInt())
         c.clipRect(rect)
+        if (camInUse && (mode == Mode.IDLE || mode == Mode.LIVE)) drawCamRing(c)
         when (mode) {
             Mode.IDLE -> if (eyes) drawEyes(c)
             Mode.LIVE -> drawLive(c)
@@ -326,6 +337,43 @@ class IslandView(context: Context, private val host: Host) : View(context) {
             Mode.EXPANDED -> if (page == 1 && media != null) drawMedia(c) else drawControls(c)
         }
         c.restore()
+    }
+
+    /** Glowing rings that spin around the camera hole while an app uses the camera. */
+    private fun drawCamRing(c: Canvas) {
+        val cx = width / 2f + camDx
+        val cy = camY
+        val maxR = curH / 2f - dp(1.5f)
+        val r = min(camR + dp(5f), maxR)
+        val t = SystemClock.uptimeMillis()
+        // grow in when the camera first turns on
+        val intro = ((t - camRingStart) / 400f).coerceIn(0f, 1f)
+        val rr = r * (0.6f + 0.4f * intro)
+        val spin = (t % 1200L) / 1200f * 360f
+        val pulse = 0.5f + 0.5f * sin(t / 260f)
+
+        paint.style = Paint.Style.STROKE
+        // soft pulsing halo
+        paint.strokeWidth = dp(4f)
+        paint.color = green
+        paint.alpha = (60 + 70 * pulse).toInt()
+        c.drawCircle(cx, cy, rr, paint)
+        // two arcs spinning in opposite directions
+        paint.strokeWidth = dp(2.2f)
+        paint.alpha = 255
+        r2.set(cx - rr, cy - rr, cx + rr, cy + rr)
+        c.drawArc(r2, spin, 110f, false, paint)
+        c.drawArc(r2, spin + 180f, 110f, false, paint)
+        val ri = rr - dp(3.2f)
+        if (ri > camR) {
+            paint.strokeWidth = dp(1.4f)
+            paint.alpha = 180
+            r2.set(cx - ri, cy - ri, cx + ri, cy + ri)
+            c.drawArc(r2, -spin * 1.4f, 70f, false, paint)
+            c.drawArc(r2, -spin * 1.4f + 180f, 70f, false, paint)
+        }
+        paint.alpha = 255
+        paint.style = Paint.Style.FILL
     }
 
     private fun drawEyes(c: Canvas) {
