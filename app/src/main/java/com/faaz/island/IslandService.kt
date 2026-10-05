@@ -146,8 +146,8 @@ class IslandService : AccessibilityService(), IslandView.Host {
         val d = resources.displayMetrics.density
         val dx = (prefs.getInt(Prefs.DX, 50) - 50) * d
         val dy = (prefs.getInt(Prefs.DY, 30) - 30) * d
-        var bw = prefs.getInt(Prefs.W, 96) * d
-        var bh = prefs.getInt(Prefs.H, 30) * d
+        val bw = prefs.getInt(Prefs.W, 96) * d
+        val bh = prefs.getInt(Prefs.H, 30) * d
 
         // Find the real camera hole and center the pill on it
         val screenW = realScreenWidth()
@@ -159,8 +159,6 @@ class IslandService : AccessibilityService(), IslandView.Host {
             camCx = cut.exactCenterX()
             camCy = cut.exactCenterY()
             camR = max(cut.width(), cut.height()) / 2f
-            bh = max(bh, camR * 2 + 10 * d)   // always taller than the hole
-            bw = max(bw, camR * 2 + 44 * d)   // always wider than the hole
         } else {
             camCx = screenW / 2f
             camCy = 6 * d + bh / 2f
