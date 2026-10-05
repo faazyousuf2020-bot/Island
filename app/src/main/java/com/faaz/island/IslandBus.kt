@@ -22,6 +22,8 @@ object Prefs {
     const val DY = "dy"   // fine-tune up/down around the camera (center = 30)
     const val DX = "dx"   // fine-tune left/right around the camera (center = 50)
     const val CAMRING = "camring"
+    const val GLOW = "glow"
+    const val PERM_TS = "perm_ts"
 }
 
 fun Drawable.toBmp(size: Int): Bitmap {

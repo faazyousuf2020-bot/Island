@@ -23,10 +23,13 @@ import android.view.View
 import android.view.animation.DecelerateInterpolator
 import android.view.animation.OvershootInterpolator
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.ceil
+import kotlin.math.cos
+import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
@@ -84,6 +87,25 @@ class IslandView(context: Context, private val host: Host) : View(context) {
             startTicking()
         }
     private var camRingStart = 0L
+
+    // pet mode (fed by the motion sensor)
+    var tiltX = 0f
+    var tiltY = 0f
+    var lastMove = SystemClock.uptimeMillis()
+    var dizzyUntil = 0L
+
+    // music glow
+    var glowOn = true
+    var glowColor = 0xFF7CF29C.toInt()
+    var levelSource: (() -> Float)? = null
+    private var beat = 0f
+
+    private enum class Mood { NORMAL, DIZZY, SURPRISED, SLEEPING, HAPPY, TIRED }
+    private var mood = Mood.NORMAL
+    private var surprisedUntil = 0L
+    private var wasSleeping = false
+    private var night = false
+    private var nightCheckedAt = 0L
     var paused = false
         set(value) {
             field = value
@@ -134,6 +156,9 @@ class IslandView(context: Context, private val host: Host) : View(context) {
     private val liveP = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
         color = orange; textSize = dp(14f); typeface = Typeface.DEFAULT_BOLD
         textAlign = Paint.Align.RIGHT
+    }
+    private val zP = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE; typeface = Typeface.DEFAULT_BOLD
     }
     private val rect = RectF()
     private val r2 = RectF()
@@ -298,13 +323,24 @@ class IslandView(context: Context, private val host: Host) : View(context) {
             return
         }
         val now = SystemClock.uptimeMillis()
-        if (now > nextLook) {
+        updateMood(now)
+        if (now - lastMove < 1500L) {
+            // phone is moving → look the way it's tilted
+            tLookX = tiltX
+            tLookY = tiltY * 0.7f
+        } else if (now > nextLook) {
             tLookX = Random.nextFloat() * 2f - 1f
             tLookY = Random.nextFloat() * 1.2f - 0.6f
             nextLook = now + 900L + Random.nextLong(1600L)
         }
-        lookX += (tLookX - lookX) * 0.18f
-        lookY += (tLookY - lookY) * 0.18f
+        if (mood == Mood.TIRED) tLookY = 0.7f
+        val ease = if (mood == Mood.TIRED) 0.06f else 0.18f
+        lookX += (tLookX - lookX) * ease
+        lookY += (tLookY - lookY) * ease
+
+        // music glow level: real beat if available, otherwise a soft 125bpm pulse
+        val raw = levelSource?.invoke() ?: exp(-(now % 480L) / 110f)
+        beat = if (raw > beat) raw else beat * 0.88f
         if (now > nextBlink) {
             blinkStart = now
             nextBlink = now + 2500L + Random.nextLong(3500L)
@@ -329,6 +365,10 @@ class IslandView(context: Context, private val host: Host) : View(context) {
 
         c.saveLayerAlpha(rect, (contentAlpha * 255).toInt())
         c.clipRect(rect)
+        val m = media
+        if (glowOn && m != null && m.playing &&
+            (mode == Mode.LIVE || (mode == Mode.EXPANDED && page == 1))
+        ) drawGlow(c, radius)
         if (camInUse && (mode == Mode.IDLE || mode == Mode.LIVE)) drawCamRing(c)
         when (mode) {
             Mode.IDLE -> if (eyes) drawEyes(c)
@@ -376,24 +416,131 @@ class IslandView(context: Context, private val host: Host) : View(context) {
         paint.style = Paint.Style.FILL
     }
 
+    // ---------------- pet moods ----------------
+
+    private fun updateMood(now: Long) {
+        if (nightCheckedAt == 0L || now - nightCheckedAt > 30_000L) {
+            val h = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+            night = h >= 23 || h < 6
+            nightCheckedAt = now
+        }
+        val sleeping = night && now - lastMove > 10_000L
+        if (wasSleeping && !sleeping) surprisedUntil = now + 1600L // woke up!
+        wasSleeping = sleeping
+        mood = when {
+            now < dizzyUntil -> Mood.DIZZY
+            now < surprisedUntil -> Mood.SURPRISED
+            sleeping -> Mood.SLEEPING
+            charging -> Mood.HAPPY
+            battery in 1..15 -> Mood.TIRED
+            else -> Mood.NORMAL
+        }
+    }
+
     private fun drawEyes(c: Canvas) {
+        val now = SystemClock.uptimeMillis()
         val cy = curH / 2f
         val r = curH * 0.3f
         val off = curW * 0.3f
-        val t = SystemClock.uptimeMillis() - blinkStart
-        val open = if (t in 0L..180L) abs(t - 90L) / 90f else 1f
+        val t = now - blinkStart
+        val blinkLen = if (mood == Mood.TIRED) 520L else 180L
+        val open = if (t in 0L..blinkLen) abs(t - blinkLen / 2) / (blinkLen / 2f) else 1f
         val oy = r * max(open, 0.12f)
+
         for (sx in floatArrayOf(-1f, 1f)) {
             val ex = width / 2f + sx * off
-            paint.style = Paint.Style.FILL
             paint.color = Color.WHITE
-            r2.set(ex - r, cy - oy, ex + r, cy + oy)
-            c.drawOval(r2, paint)
-            if (open > 0.45f) {
-                paint.color = Color.BLACK
-                c.drawCircle(ex + lookX * r * 0.45f, cy + lookY * r * 0.45f, r * 0.5f, paint)
+            paint.strokeCap = Paint.Cap.ROUND
+            when (mood) {
+                Mood.HAPPY -> { // ^ ^
+                    paint.style = Paint.Style.STROKE
+                    paint.strokeWidth = r * 0.42f
+                    r2.set(ex - r * 0.85f, cy - r * 0.5f, ex + r * 0.85f, cy + r * 1.2f)
+                    c.drawArc(r2, 200f, 140f, false, paint)
+                }
+                Mood.SLEEPING -> { // closed ‿ ‿
+                    paint.style = Paint.Style.STROKE
+                    paint.strokeWidth = r * 0.3f
+                    r2.set(ex - r * 0.85f, cy - r * 1.2f, ex + r * 0.85f, cy + r * 0.5f)
+                    c.drawArc(r2, 20f, 140f, false, paint)
+                }
+                Mood.DIZZY -> { // spinning spirals
+                    paint.style = Paint.Style.FILL
+                    c.drawCircle(ex, cy, r, paint)
+                    paint.style = Paint.Style.STROKE
+                    paint.strokeWidth = r * 0.17f
+                    paint.color = Color.BLACK
+                    val rot = (now % 700L) / 700f * 6.2832f * sx
+                    path.reset()
+                    for (i in 0..40) {
+                        val th = i / 40f * 12.566f
+                        val rad = r * 0.82f * th / 12.566f
+                        val px = ex + rad * cos(th + rot)
+                        val py = cy + rad * sin(th + rot)
+                        if (i == 0) path.moveTo(px, py) else path.lineTo(px, py)
+                    }
+                    c.drawPath(path, paint)
+                }
+                Mood.SURPRISED -> { // big eyes, tiny pupils
+                    paint.style = Paint.Style.FILL
+                    val big = min(r * 1.2f, curH / 2f - dp(1f))
+                    c.drawCircle(ex, cy, big, paint)
+                    paint.color = Color.BLACK
+                    c.drawCircle(ex, cy, big * 0.3f, paint)
+                }
+                Mood.TIRED -> { // droopy half-closed lids
+                    paint.style = Paint.Style.FILL
+                    r2.set(ex - r, cy - oy, ex + r, cy + oy)
+                    c.drawOval(r2, paint)
+                    paint.color = Color.BLACK
+                    if (open > 0.45f) c.drawCircle(ex + lookX * r * 0.4f, cy + lookY * r * 0.45f, r * 0.45f, paint)
+                    c.drawRect(ex - r - 2f, cy - r - 2f, ex + r + 2f, cy - r * 0.05f, paint)
+                }
+                Mood.NORMAL -> {
+                    paint.style = Paint.Style.FILL
+                    r2.set(ex - r, cy - oy, ex + r, cy + oy)
+                    c.drawOval(r2, paint)
+                    if (open > 0.45f) {
+                        paint.color = Color.BLACK
+                        c.drawCircle(ex + lookX * r * 0.45f, cy + lookY * r * 0.45f, r * 0.5f, paint)
+                    }
+                }
             }
         }
+        paint.strokeCap = Paint.Cap.BUTT
+        paint.style = Paint.Style.FILL
+
+        if (mood == Mood.SLEEPING) { // floating z's
+            for (k in 0..1) {
+                val ph = ((now + k * 1000L) % 2000L) / 2000f
+                zP.textSize = dp(7f) + ph * dp(3f)
+                zP.alpha = ((1f - ph) * 255).toInt()
+                val zx = width / 2f + off + r + dp(4f) + ph * dp(4f)
+                val zy = cy + r - ph * curH * 0.45f
+                c.drawText("z", zx, zy, zP)
+            }
+        }
+    }
+
+    /** Rim of the pill glows in the album-art colour and pulses with the music. */
+    private fun drawGlow(c: Canvas, radius: Float) {
+        paint.style = Paint.Style.STROKE
+        paint.color = glowColor
+        paint.strokeWidth = dp(6f)
+        paint.alpha = (35 + 120 * beat).toInt().coerceIn(0, 255)
+        r2.set(rect)
+        r2.inset(dp(3f), dp(3f))
+        val rr = (radius - dp(3f)).coerceAtLeast(0f)
+        c.drawRoundRect(r2, rr, rr, paint)
+        paint.color = glowColor
+        paint.strokeWidth = dp(1.8f)
+        paint.alpha = (110 + 145 * beat).toInt().coerceIn(0, 255)
+        r2.set(rect)
+        r2.inset(dp(1.2f), dp(1.2f))
+        val r3 = (radius - dp(1.2f)).coerceAtLeast(0f)
+        c.drawRoundRect(r2, r3, r3, paint)
+        paint.alpha = 255
+        paint.style = Paint.Style.FILL
     }
 
     private fun drawLive(c: Canvas) {

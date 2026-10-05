@@ -1,6 +1,8 @@
 package com.faaz.island
 
+import android.Manifest
 import android.app.Activity
+import android.content.pm.PackageManager
 import android.content.Intent
 import android.content.SharedPreferences
 import android.graphics.Color
@@ -24,6 +26,7 @@ class MainActivity : Activity() {
     private lateinit var prefs: SharedPreferences
     private lateinit var a11yStatus: TextView
     private lateinit var notifStatus: TextView
+    private lateinit var beatBtn: Button
     private val grey = 0xFFA8A8B0.toInt()
     private val accent = 0xFF6C5CE7.toInt()
 
@@ -65,7 +68,15 @@ class MainActivity : Activity() {
         root.addView(switch("Notification popups", Prefs.NOTIF, true))
         root.addView(switch("Charging animation", Prefs.CHARGE, true))
         root.addView(switch("Spinning ring when camera is in use", Prefs.CAMRING, true))
-        root.addView(switch("Googly eyes when idle 👀", Prefs.EYES, false))
+        root.addView(switch("Pet eyes 👀 (tilt, shake, sleep, moods)", Prefs.EYES, false))
+        root.addView(switch("Music glow (album colour)", Prefs.GLOW, true))
+        beatBtn = button("Sync glow to the beat (allow mic)") {
+            if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 7)
+            }
+        }
+        root.addView(beatBtn)
+        root.addView(text("Mic is only used to feel the music's loudness — nothing is recorded or saved.", 12f, grey))
 
         root.addView(header("Fit it to your camera"))
         root.addView(slider("Width", Prefs.W, 50, 240, 96))
@@ -99,7 +110,8 @@ class MainActivity : Activity() {
                     "• Swipe sideways in big view → music ↔ controls\n" +
                     "• Swipe down on pill → open  •  Swipe up → close\n" +
                     "• Any app using the camera → green ring spins around it\n" +
-                    "• Double-tap pill → eyes on/off\n" +
+                    "• Double-tap pill → pet eyes on/off\n" +
+                    "• Pet: tilt the phone → it looks around; shake → dizzy;\n   after 11pm it sleeps and wakes when you pick it up;\n   happy while charging, sleepy below 15% battery\n" +
                     "• Long-press pill → this screen\n" +
                     "• Tap a notification popup → opens it\n" +
                     "• Hides itself in landscape", 14f, Color.WHITE).apply {
@@ -114,8 +126,21 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        refreshStatus()
+    }
+
+    private fun refreshStatus() {
         a11yStatus.text = if (a11yOn()) "✅ Island service is on" else "❌ Island service is off"
+        beatBtn.text = if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
+            "✅ Glow is synced to the beat" else "Sync glow to the beat (allow mic)"
         notifStatus.text = if (notifAccessOn()) "✅ Notification access allowed" else "❌ Notification access not allowed"
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        // nudge the island so it starts listening right away
+        prefs.edit().putLong(Prefs.PERM_TS, System.currentTimeMillis()).apply()
+        refreshStatus()
     }
 
     private fun a11yOn(): Boolean {

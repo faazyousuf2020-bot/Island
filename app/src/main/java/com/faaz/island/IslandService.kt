@@ -9,7 +9,19 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.content.res.Configuration
+import android.Manifest
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Color
 import android.graphics.PixelFormat
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
+import android.media.audiofx.Visualizer
+import android.os.SystemClock
+import kotlin.math.abs
+import kotlin.math.sqrt
 import android.graphics.Rect
 import android.util.DisplayMetrics
 import kotlin.math.max
@@ -90,6 +102,7 @@ class IslandService : AccessibilityService(), IslandView.Host {
         }
         IslandBus.onListenerReady = { handler.post { setupMedia() } }
         setupMedia()
+        updateSensors()
         view.refresh()
     }
 
@@ -112,6 +125,8 @@ class IslandService : AccessibilityService(), IslandView.Host {
         try { cam.unregisterAvailabilityCallback(camAvail) } catch (e: Exception) {}
         try { msm?.removeOnActiveSessionsChangedListener(sessionsListener) } catch (e: Exception) {}
         controller?.unregisterCallback(mcCallback)
+        try { sm.unregisterListener(accel) } catch (e: Exception) {}
+        releaseViz()
         try { wm.removeView(view) } catch (e: Exception) {}
         super.onDestroy()
     }
@@ -162,6 +177,7 @@ class IslandService : AccessibilityService(), IslandView.Host {
 
         view.eyes = prefs.getBoolean(Prefs.EYES, false)
         camRingOn = prefs.getBoolean(Prefs.CAMRING, true)
+        view.glowOn = prefs.getBoolean(Prefs.GLOW, true)
         view.camInUse = camRingOn && busyCams.isNotEmpty()
         notifOn = prefs.getBoolean(Prefs.NOTIF, true)
         chargeOn = prefs.getBoolean(Prefs.CHARGE, true)
@@ -171,6 +187,8 @@ class IslandService : AccessibilityService(), IslandView.Host {
             try { wm.updateViewLayout(view, lp) } catch (e: Exception) {}
         }
         view.relayout()
+        updateSensors()
+        updateViz()
     }
 
     // ---------------- IslandView.Host ----------------
@@ -279,7 +297,11 @@ class IslandService : AccessibilityService(), IslandView.Host {
 
     private val screenRx = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
-            view.paused = i.action == Intent.ACTION_SCREEN_OFF
+            screenOff = i.action == Intent.ACTION_SCREEN_OFF
+            if (!screenOff) view.lastMove = SystemClock.uptimeMillis()
+            view.paused = screenOff
+            updateSensors()
+            updateViz()
         }
     }
 
@@ -422,6 +444,142 @@ class IslandService : AccessibilityService(), IslandView.Host {
             else MediaInfo(title, artist, art,
                 st == PlaybackState.STATE_PLAYING || st == PlaybackState.STATE_BUFFERING)
         }
+        val art = view.media?.art
+        if (art !== lastArt) {
+            lastArt = art
+            view.glowColor = vibrantColor(art)
+        }
+        updateViz()
         view.refresh()
+    }
+
+    // ---------------- pet mode: motion sensor ----------------
+
+    private var screenOff = false
+    private val sm by lazy { getSystemService(SENSOR_SERVICE) as SensorManager }
+    private var accelOn = false
+    private val lastG = FloatArray(3)
+    private var spikeWindow = 0L
+    private var spikeCount = 0
+
+    private val accel = object : SensorEventListener {
+        override fun onSensorChanged(e: SensorEvent) {
+            val x = e.values[0]
+            val y = e.values[1]
+            val z = e.values[2]
+            val now = SystemClock.uptimeMillis()
+            val delta = abs(x - lastG[0]) + abs(y - lastG[1]) + abs(z - lastG[2])
+            lastG[0] = x; lastG[1] = y; lastG[2] = z
+            if (delta > 1.2f) view.lastMove = now
+            // shake → dizzy
+            val mag = sqrt(x * x + y * y + z * z)
+            if (abs(mag - 9.81f) > 7f) {
+                if (now - spikeWindow > 1000L) {
+                    spikeWindow = now
+                    spikeCount = 0
+                }
+                spikeCount++
+                if (spikeCount >= 4) {
+                    view.dizzyUntil = now + 2600L
+                    spikeCount = 0
+                }
+            }
+            // tilt → where the eyes look
+            view.tiltX = (-x / 6f).coerceIn(-1f, 1f)
+            view.tiltY = ((8f - y) / 5f).coerceIn(-1f, 1f)
+        }
+
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    }
+
+    private fun updateSensors() {
+        if (!ready) return
+        val want = view.eyes && !screenOff && view.visibility == View.VISIBLE
+        if (want && !accelOn) {
+            val s = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER) ?: return
+            accelOn = sm.registerListener(accel, s, SensorManager.SENSOR_DELAY_UI, handler)
+        } else if (!want && accelOn) {
+            sm.unregisterListener(accel)
+            accelOn = false
+        }
+    }
+
+    // ---------------- music glow ----------------
+
+    private var lastArt: Bitmap? = null
+    private var viz: Visualizer? = null
+    private var avgLevel = 0f
+    private val rms = Visualizer.MeasurementPeakRms()
+
+    private fun updateViz() {
+        if (!ready) return
+        val want = view.glowOn && !screenOff && view.media?.playing == true &&
+                checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        if (want && viz == null) {
+            try {
+                val v = Visualizer(0)
+                v.setMeasurementMode(Visualizer.MEASUREMENT_MODE_PEAK_RMS)
+                v.setEnabled(true)
+                viz = v
+                view.levelSource = { readLevel() }
+            } catch (e: Throwable) {
+                viz = null
+                view.levelSource = null
+            }
+        } else if (!want && viz != null) {
+            releaseViz()
+        }
+    }
+
+    private fun readLevel(): Float {
+        val v = viz ?: return 0f
+        return try {
+            v.getMeasurementPeakRms(rms)
+            // rms is in millibels: about -9600 (silent) to 0 (max)
+            val level = ((rms.mRms + 4000f) / 3500f).coerceIn(0f, 1f)
+            avgLevel = avgLevel * 0.95f + level * 0.05f
+            ((level - avgLevel) * 3f + level * 0.35f).coerceIn(0f, 1f)
+        } catch (e: Throwable) {
+            0f
+        }
+    }
+
+    private fun releaseViz() {
+        view.levelSource = null
+        try {
+            viz?.setEnabled(false)
+            viz?.release()
+        } catch (e: Throwable) {
+        }
+        viz = null
+    }
+
+    /** Picks the most colourful pixel of the album art. */
+    private fun vibrantColor(b: Bitmap?): Int {
+        val fallback = 0xFF7CF29C.toInt()
+        if (b == null) return fallback
+        return try {
+            val src = if (b.config == Bitmap.Config.HARDWARE) b.copy(Bitmap.Config.ARGB_8888, false) else b
+            val s = Bitmap.createScaledBitmap(src, 24, 24, true)
+            val hsv = FloatArray(3)
+            var best = fallback
+            var bestScore = -1f
+            for (x in 0 until 24) for (y in 0 until 24) {
+                val p = s.getPixel(x, y)
+                Color.colorToHSV(p, hsv)
+                val score = hsv[1] * hsv[2] * (if (hsv[2] < 0.35f) 0.3f else 1f)
+                if (score > bestScore) {
+                    bestScore = score
+                    best = p
+                }
+            }
+            if (bestScore < 0.12f) return Color.WHITE
+            Color.colorToHSV(best, hsv)
+            hsv[1] = max(hsv[1], 0.6f)
+            hsv[2] = max(hsv[2], 0.9f)
+            Color.HSVToColor(hsv)
+        } catch (e: Throwable) {
+            fallback
+        }
     }
 }
