@@ -23,6 +23,7 @@ object Prefs {
     const val DX = "dx"   // fine-tune left/right around the camera (center = 50)
     const val CAMRING = "camring"
     const val GLOW = "glow"
+    const val BEST = "best"
     const val PERM_TS = "perm_ts"
 }
 

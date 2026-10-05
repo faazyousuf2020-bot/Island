@@ -51,7 +51,7 @@ data class Alert(
     enum class Kind { NOTIFICATION, CHARGING, TIMER_DONE }
 }
 
-enum class Action { OPEN_ALERT, TORCH, TIMER_1, TIMER_5, TIMER_STOP, EYES, PLAY_PAUSE, NEXT, PREV, SETTINGS }
+enum class Action { OPEN_ALERT, TORCH, TIMER_1, TIMER_5, TIMER_STOP, EYES, PLAY_PAUSE, NEXT, PREV, SETTINGS, GAME }
 
 @SuppressLint("ViewConstructor")
 class IslandView(context: Context, private val host: Host) : View(context) {
@@ -60,9 +60,10 @@ class IslandView(context: Context, private val host: Host) : View(context) {
         fun resizeWindow(w: Int, h: Int)
         fun onAction(action: Action, alert: Alert?)
         fun onTimerDone()
+        fun onGameBest(best: Int)
     }
 
-    private enum class Mode { IDLE, LIVE, ALERT, EXPANDED }
+    private enum class Mode { IDLE, LIVE, ALERT, EXPANDED, GAME }
 
     private val density = resources.displayMetrics.density
     private fun dp(v: Float) = v * density
@@ -183,7 +184,7 @@ class IslandView(context: Context, private val host: Host) : View(context) {
             Mode.IDLE -> (if (eyes) max(baseW, baseH * 3.8f) else baseW) to baseH
             Mode.LIVE -> min(baseW + dp(130f), maxW) to baseH
             Mode.ALERT -> min(dp(360f), maxW) to max(dp(68f), baseH)
-            Mode.EXPANDED -> min(dp(400f), maxW) to dp(200f)
+            Mode.EXPANDED, Mode.GAME -> min(dp(400f), maxW) to dp(200f)
         }
     }
 
@@ -218,7 +219,7 @@ class IslandView(context: Context, private val host: Host) : View(context) {
 
     /** Call when data changes (music, timer, battery…). */
     fun refresh() {
-        if (mode == Mode.ALERT || mode == Mode.EXPANDED) {
+        if (mode == Mode.ALERT || mode == Mode.EXPANDED || mode == Mode.GAME) {
             invalidate(); startTicking(); return
         }
         go(if (hasLive()) Mode.LIVE else Mode.IDLE)
@@ -228,7 +229,7 @@ class IslandView(context: Context, private val host: Host) : View(context) {
     fun relayout() = go(mode)
 
     fun showAlert(a: Alert) {
-        if (mode == Mode.EXPANDED) return
+        if (mode == Mode.EXPANDED || mode == Mode.GAME) return
         alert = a
         alertStart = SystemClock.uptimeMillis()
         removeCallbacks(endAlert)
@@ -258,7 +259,7 @@ class IslandView(context: Context, private val host: Host) : View(context) {
     }
 
     fun collapse() {
-        if (mode != Mode.EXPANDED) return
+        if (mode != Mode.EXPANDED && mode != Mode.GAME) return
         removeCallbacks(autoCollapse)
         mode = Mode.IDLE
         refresh()
@@ -284,7 +285,7 @@ class IslandView(context: Context, private val host: Host) : View(context) {
             if (needsFrames()) {
                 onTick()
                 invalidate()
-                postDelayed(this, 33L)
+                postDelayed(this, if (mode == Mode.GAME) 16L else 33L)
             } else {
                 ticking = false
             }
@@ -293,7 +294,7 @@ class IslandView(context: Context, private val host: Host) : View(context) {
 
     private fun needsFrames(): Boolean {
         if (paused || !isAttachedToWindow || visibility != VISIBLE) return false
-        return (eyes && mode == Mode.IDLE) || mode == Mode.EXPANDED || mode == Mode.ALERT || camInUse ||
+        return (eyes && mode == Mode.IDLE) || mode == Mode.EXPANDED || mode == Mode.GAME || mode == Mode.ALERT || camInUse ||
                 hasLive() || timerEnd != 0L
     }
 
@@ -323,6 +324,7 @@ class IslandView(context: Context, private val host: Host) : View(context) {
             return
         }
         val now = SystemClock.uptimeMillis()
+        if (mode == Mode.GAME) stepGame(now)
         updateMood(now)
         if (now - lastMove < 1500L) {
             // phone is moving → look the way it's tilted
@@ -375,6 +377,7 @@ class IslandView(context: Context, private val host: Host) : View(context) {
             Mode.LIVE -> drawLive(c)
             Mode.ALERT -> drawAlert(c)
             Mode.EXPANDED -> if (page == 1 && media != null) drawMedia(c) else drawControls(c)
+            Mode.GAME -> drawGame(c)
         }
         c.restore()
     }
@@ -690,6 +693,7 @@ class IslandView(context: Context, private val host: Host) : View(context) {
             Triple("🔦", "Torch", Action.TORCH) to torchOn,
             Triple("⏱", "+1 min", Action.TIMER_1) to false,
             Triple("⏳", "+5 min", Action.TIMER_5) to false,
+            Triple("🎮", "Game", Action.GAME) to false,
             (if (stop) Triple("✋", "Stop timer", Action.TIMER_STOP)
             else Triple("👀", if (eyes) "Eyes off" else "Eyes", Action.EYES)) to (eyes && !stop)
         )
@@ -821,7 +825,7 @@ class IslandView(context: Context, private val host: Host) : View(context) {
 
         override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
             when (mode) {
-                Mode.EXPANDED -> {}
+                Mode.EXPANDED, Mode.GAME -> {}
                 Mode.ALERT -> {
                     val a = alert
                     if (a != null && a.kind == Alert.Kind.NOTIFICATION) host.onAction(Action.OPEN_ALERT, a)
@@ -842,6 +846,7 @@ class IslandView(context: Context, private val host: Host) : View(context) {
         }
 
         override fun onLongPress(e: MotionEvent) {
+            if (mode == Mode.GAME) return
             haptic()
             host.onAction(Action.SETTINGS, null)
         }
@@ -854,6 +859,7 @@ class IslandView(context: Context, private val host: Host) : View(context) {
                     } else if (velocityY < 0) collapse()
                 }
                 Mode.ALERT -> if (velocityY < 0) dismissAlert() else if (velocityY > 0) expand()
+                Mode.GAME -> if (velocityY < 0 && abs(velocityY) > abs(velocityX)) collapse()
                 else -> if (velocityY > 0) expand()
             }
             return true
@@ -863,7 +869,10 @@ class IslandView(context: Context, private val host: Host) : View(context) {
     private fun tapExpanded(x: Float, y: Float) {
         bumpAutoCollapse()
         val hit = buttons.firstOrNull { it.first.contains(x, y) }
-        if (hit != null) {
+        if (hit != null && hit.second == Action.GAME) {
+            haptic()
+            startGame()
+        } else if (hit != null) {
             haptic()
             host.onAction(hit.second, null)
             invalidate()
@@ -878,6 +887,203 @@ class IslandView(context: Context, private val host: Host) : View(context) {
             collapse()
             return false
         }
+        if (mode == Mode.GAME && event.actionMasked == MotionEvent.ACTION_DOWN) gameTap()
         return gd.onTouchEvent(event)
+    }
+
+    // =====================================================================
+    // Island Jump — tiny runner game
+    // =====================================================================
+
+    var gameBest = 0
+    private class Ob(var x: Float, val w: Float, val h: Float, val color: Int)
+    private val obs = ArrayList<Ob>()
+    private var gY = 0f          // player height above ground
+    private var gV = 0f          // vertical speed (up is +)
+    private var gScore = 0
+    private var gStarted = false
+    private var gOver = false
+    private var gOverAt = 0L
+    private var gLast = 0L
+    private var gSpawnIn = 0f
+    private var gDist = 0f
+    private var gNewBest = false
+    private val obColors = intArrayOf(0xFF7CF29C.toInt(), 0xFFFFA94D.toInt(), 0xFF74C0FC.toInt(), 0xFFF783AC.toInt())
+
+    private fun startGame() {
+        removeCallbacks(autoCollapse)
+        resetGame()
+        go(Mode.GAME)
+        bumpGameIdle()
+    }
+
+    private fun resetGame() {
+        obs.clear()
+        gY = 0f; gV = 0f; gScore = 0; gDist = 0f
+        gStarted = false; gOver = false; gNewBest = false
+        gSpawnIn = 0.6f
+        gLast = SystemClock.uptimeMillis()
+    }
+
+    private fun bumpGameIdle() {
+        removeCallbacks(autoCollapse)
+        postDelayed(autoCollapse, 30_000L)
+    }
+
+    private fun gameTap() {
+        bumpGameIdle()
+        val now = SystemClock.uptimeMillis()
+        if (gOver) {
+            if (now - gOverAt > 600L) { resetGame(); gStarted = true; jump() }
+            return
+        }
+        gStarted = true
+        jump()
+    }
+
+    private fun jump() {
+        if (gY <= 0.5f) {
+            gV = dp(640f)
+            performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+        }
+    }
+
+    private fun gSpeed() = min(dp(190f) + gScore * dp(7f), dp(430f))
+
+    private fun stepGame(now: Long) {
+        val dt = ((now - gLast) / 1000f).coerceIn(0f, 0.05f)
+        gLast = now
+        if (!gStarted || gOver || contentAlpha < 1f) return
+
+        // player physics
+        gV -= dp(2200f) * dt
+        gY = max(0f, gY + gV * dt)
+        if (gY == 0f && gV < 0f) gV = 0f
+
+        // move obstacles
+        val speed = gSpeed()
+        gDist += speed * dt
+        val playerX = left0 + dp(56f)
+        val pr = dp(13f)
+        val ground = curH - dp(34f)
+        val py = ground - pr - gY
+        val iter = obs.iterator()
+        while (iter.hasNext()) {
+            val o = iter.next()
+            val before = o.x + o.w
+            o.x -= speed * dt
+            if (before >= playerX - pr && o.x + o.w < playerX - pr) {
+                gScore++
+                if (gScore % 10 == 0) haptic()
+            }
+            if (o.x + o.w < left0) iter.remove()
+            // collision (circle vs box, a little forgiving)
+            val nx = playerX.coerceIn(o.x, o.x + o.w)
+            val ny = py.coerceIn(ground - o.h, ground)
+            val ddx = playerX - nx
+            val ddy = py - ny
+            if (ddx * ddx + ddy * ddy < (pr * 0.82f) * (pr * 0.82f)) {
+                gOver = true
+                gOverAt = now
+                performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                if (gScore > gameBest) {
+                    gameBest = gScore
+                    gNewBest = true
+                    host.onGameBest(gameBest)
+                }
+            }
+        }
+
+        // spawn new obstacles
+        gSpawnIn -= dt
+        if (gSpawnIn <= 0f) {
+            val w = dp(12f) + Random.nextFloat() * dp(12f)
+            val h = dp(16f) + Random.nextFloat() * dp(20f)
+            obs.add(Ob(right0, w, h, obColors[Random.nextInt(obColors.size)]))
+            val gap = 0.75f + Random.nextFloat() * 0.9f
+            gSpawnIn = gap * (dp(230f) / speed).coerceIn(0.55f, 1.2f)
+        }
+    }
+
+    private fun drawGame(c: Canvas) {
+        val ground = curH - dp(34f)
+        val playerX = left0 + dp(56f)
+        val pr = dp(13f)
+        val py = ground - pr - gY
+
+        // twinkly background dots (parallax)
+        paint.style = Paint.Style.FILL
+        paint.color = 0xFF3A3A44.toInt()
+        for (i in 0 until 9) {
+            val span = curW
+            val sx = left0 + ((i * 97f * density - gDist * 0.25f) % span + span) % span
+            val sy = dp(70f) + (i * 37 % 60) * density
+            c.drawCircle(sx, sy, dp(1.4f), paint)
+        }
+
+        // ground
+        paint.color = 0xFF55555C.toInt()
+        c.drawRect(left0 + dp(18f), ground, right0 - dp(18f), ground + dp(2f), paint)
+        // ground dashes moving
+        paint.color = 0xFF3A3A44.toInt()
+        val step = dp(28f)
+        var gx = left0 + dp(18f) - (gDist % step)
+        while (gx < right0 - dp(24f)) {
+            if (gx > left0 + dp(18f)) c.drawRect(gx, ground + dp(8f), gx + dp(8f), ground + dp(10f), paint)
+            gx += step
+        }
+
+        // obstacles
+        for (o in obs) {
+            paint.color = o.color
+            r2.set(o.x, ground - o.h, o.x + o.w, ground)
+            c.drawRoundRect(r2, dp(4f), dp(4f), paint)
+        }
+
+        // player: the pet blob
+        val squash = if (gY == 0f && gStarted && !gOver) 1f + 0.06f * sin(gDist / dp(8f)) else 1f
+        paint.color = Color.WHITE
+        r2.set(playerX - pr * squash, py - pr / squash, playerX + pr * squash, py + pr)
+        c.drawOval(r2, paint)
+        paint.color = Color.BLACK
+        if (gOver) {
+            paint.style = Paint.Style.STROKE
+            paint.strokeWidth = dp(1.8f)
+            for (ex in floatArrayOf(playerX - pr * 0.1f, playerX + pr * 0.45f)) {
+                val ey = py - pr * 0.2f
+                val k = pr * 0.17f
+                c.drawLine(ex - k, ey - k, ex + k, ey + k, paint)
+                c.drawLine(ex - k, ey + k, ex + k, ey - k, paint)
+            }
+            paint.style = Paint.Style.FILL
+        } else {
+            c.drawCircle(playerX + pr * 0.05f, py - pr * 0.2f, pr * 0.16f, paint)
+            c.drawCircle(playerX + pr * 0.5f, py - pr * 0.2f, pr * 0.16f, paint)
+        }
+
+        // score (left) + best (right), kept clear of the camera
+        bigP.textSize = dp(30f)
+        c.drawText("$gScore", left0 + dp(22f), dp(46f), bigP)
+        bigP.textSize = dp(40f)
+        subP.textAlign = Paint.Align.RIGHT
+        c.drawText("BEST $gameBest", right0 - dp(22f), dp(40f), subP)
+        subP.textAlign = Paint.Align.LEFT
+
+        val cx = (left0 + right0) / 2f
+        if (!gStarted) {
+            titleP.textAlign = Paint.Align.CENTER
+            c.drawText("Tap to jump", cx, dp(96f), titleP)
+            titleP.textAlign = Paint.Align.LEFT
+            capP.color = 0xFF8A8A92.toInt()
+            c.drawText("swipe up to exit", cx, dp(114f), capP)
+            capP.color = 0xFFA8A8B0.toInt()
+        } else if (gOver) {
+            titleP.textAlign = Paint.Align.CENTER
+            c.drawText(if (gNewBest) "New best! 🎉" else "Game over", cx, dp(92f), titleP)
+            titleP.textAlign = Paint.Align.LEFT
+            capP.color = 0xFF8A8A92.toInt()
+            c.drawText("tap to play again  •  swipe up to exit", cx, dp(110f), capP)
+            capP.color = 0xFFA8A8B0.toInt()
+        }
     }
 }

@@ -110,6 +110,7 @@ class MainActivity : Activity() {
                     "• Swipe sideways in big view → music ↔ controls\n" +
                     "• Swipe down on pill → open  •  Swipe up → close\n" +
                     "• Any app using the camera → green ring spins around it\n" +
+                    "• Big view → 🎮 Game: tap to jump over blocks, swipe up to exit\n" +
                     "• Double-tap pill → pet eyes on/off\n" +
                     "• Pet: tilt the phone → it looks around; shake → dizzy;\n   after 11pm it sleeps and wakes when you pick it up;\n   happy while charging, sleepy below 15% battery\n" +
                     "• Long-press pill → this screen\n" +

@@ -138,8 +138,8 @@ class IslandService : AccessibilityService(), IslandView.Host {
 
     // ---------------- settings ----------------
 
-    private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
-        if (ready) applyPrefs(true)
+    private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (ready && key != Prefs.BEST) applyPrefs(true)
     }
 
     private fun applyPrefs(update: Boolean) {
@@ -174,6 +174,7 @@ class IslandService : AccessibilityService(), IslandView.Host {
         view.camR = camR
 
         view.eyes = prefs.getBoolean(Prefs.EYES, false)
+        view.gameBest = max(view.gameBest, prefs.getInt(Prefs.BEST, 0))
         camRingOn = prefs.getBoolean(Prefs.CAMRING, true)
         view.glowOn = prefs.getBoolean(Prefs.GLOW, true)
         view.camInUse = camRingOn && busyCams.isNotEmpty()
@@ -222,8 +223,13 @@ class IslandService : AccessibilityService(), IslandView.Host {
                 } catch (e: Exception) {}
             }
             Action.OPEN_ALERT -> openAlert(alert)
+            Action.GAME -> {} // handled inside the island
         }
         view.invalidate()
+    }
+
+    override fun onGameBest(best: Int) {
+        prefs.edit().putInt(Prefs.BEST, best).apply()
     }
 
     override fun onTimerDone() {
