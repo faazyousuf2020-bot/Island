@@ -9,6 +9,10 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
 import android.graphics.Typeface
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.os.SystemClock
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
@@ -17,6 +21,7 @@ import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
+import kotlin.math.floor
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
@@ -25,25 +30,33 @@ import kotlin.math.sqrt
 import kotlin.random.Random
 
 /**
- * Full-screen "Pull & Dodge" game.
+ * Full-screen game layer.
  * Pull the island's eyes down → let go → the blob drops, bounces and splats over the
- * whole screen → drag anywhere to move the blob and dodge everything.
+ * whole screen → pick a game: Dodge (drag), Tilt Maze (tilt), Balance (tilt).
  */
 @SuppressLint("ViewConstructor")
 class DodgeView(context: Context, private val host: Host) : View(context) {
 
     interface Host {
         fun onDodgeClosed()
-        fun onDodgeBest(best: Int)
+        fun onBest(game: Int, best: Int)
         fun setDodgeTouchable(touchable: Boolean)
     }
 
-    private enum class St { PULL, SNAPBACK, DROP, FILL, PLAY, DEAD, OVER, CLOSE }
+    companion object {
+        const val DODGE = 0
+        const val MAZE = 1
+        const val BALANCE = 2
+    }
+
+    private enum class St { PULL, SNAPBACK, DROP, FILL, MENU, PLAY, DEAD, OVER, CLOSE }
 
     private val density = resources.displayMetrics.density
     private fun dp(v: Float) = v * density
 
-    var best = 0
+    /** best per game: dodge = points, maze = levels cleared, balance = tenths of a second */
+    val bests = IntArray(3)
+    private var game = DODGE
     private var st = St.PULL
     private var closed = false
     private val pill = RectF()
@@ -64,10 +77,18 @@ class DodgeView(context: Context, private val host: Host) : View(context) {
     private var snapFromY = 0f
     private var fillCx = 0f
     private var fillCy = 0f
+
+    // shared player position (used by the close animation too)
+    private var px = 0f
+    private var py = 0f
     private var lookX = 0f
     private var lookY = 0f
+    private var gameT = 0f
+    private var newBest = false
+    private var deadAt = 0L
+    private var lastFrame = 0L
 
-    // ---------------- game ----------------
+    // ---------------- dodge ----------------
     private class Hz(
         val type: Int, var x: Float, var y: Float, var vx: Float, var vy: Float,
         val r: Float, val horiz: Boolean = false, val life: Float = 99f
@@ -77,17 +98,11 @@ class DodgeView(context: Context, private val host: Host) : View(context) {
     }
 
     private val hz = ArrayList<Hz>()
-    private var px = 0f
-    private var py = 0f
     private var pvx = 0f
     private var pvy = 0f
     private val pr get() = dp(20f)
-    private var gameT = 0f
     private var bonus = 0
     private var score = 0
-    private var newBest = false
-    private var deadAt = 0L
-    private var lastFrame = 0L
     private var lastTouchX = 0f
     private var lastTouchY = 0f
     private var nextMeteor = 0f
@@ -95,21 +110,92 @@ class DodgeView(context: Context, private val host: Host) : View(context) {
     private var nextBouncer = 0f
     private var nextChaser = 0f
     private var nextStar = 0f
-    private var popups = ArrayList<Triple<Float, Float, Long>>() // +50 text
+    private val popups = ArrayList<Triple<Float, Float, Long>>()
 
-    private val stars = Array(46) { floatArrayOf(Random.nextFloat(), Random.nextFloat(), Random.nextFloat()) }
+    // ---------------- tilt maze ----------------
+    private var mLevel = 1
+    private var mCols = 0
+    private var mRows = 0
+    private var mCell = 0f
+    private var mLeft = 0f
+    private var mTop = 0f
+    private var mGoalCol = 0
+    private var mWallsH = Array(1) { BooleanArray(1) }
+    private var mWallsV = Array(1) { BooleanArray(1) }
+    private val mWalls = ArrayList<RectF>()
+    private var mVx = 0f
+    private var mVy = 0f
+    private var mTimeLeft = 0f
+    private var mClearAt = 0L
+    private var mLastBump = 0L
+
+    // ---------------- balance ----------------
+    private var bAngle = 0f
+    private var bS = 0f        // ball position along the beam (0 = middle)
+    private var bV = 0f
+    private var bWind = 0f
+    private var bWindTarget = 0f
+    private var bNextGust = 0f
+    private var bGustEnd = 0f
+    private var bFallX = 0f
+    private var bFallY = 0f
+    private var bFallVx = 0f
+    private var bFallVy = 0f
+    private val windStreaks = Array(14) { floatArrayOf(Random.nextFloat(), Random.nextFloat(), Random.nextFloat()) }
+
+    // ---------------- tilt sensor ----------------
+    private val sm = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+    private var sensorOn = false
+    private var gx = 0f
+    private var gy = 0f
+    private var gx0 = 0f
+    private var gy0 = 0f
+    private var needCal = true
+    private val sensorL = object : SensorEventListener {
+        override fun onSensorChanged(e: SensorEvent) {
+            val x = e.values[0]
+            val y = e.values[1]
+            if (needCal) {
+                gx0 = x; gy0 = y; gx = x; gy = y
+                needCal = false
+            } else {
+                gx += (x - gx) * 0.35f
+                gy += (y - gy) * 0.35f
+            }
+        }
+
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    }
+
+    private fun sensors(on: Boolean) {
+        if (on && !sensorOn) {
+            val s = sm.getDefaultSensor(Sensor.TYPE_GRAVITY) ?: sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER) ?: return
+            sensorOn = sm.registerListener(sensorL, s, SensorManager.SENSOR_DELAY_GAME)
+        } else if (!on && sensorOn) {
+            sm.unregisterListener(sensorL)
+            sensorOn = false
+        }
+    }
+
+    /** right-edge-down = +, in m/s² relative to how you held the phone at the start */
+    private fun tiltX() = -(gx - gx0)
+    /** top-edge-down (towards you) = −, bottom-edge-down = + */
+    private fun tiltY() = gy - gy0
 
     // ---------------- paints ----------------
     private val bg = 0xFF050507.toInt()
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val black = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.BLACK }
     private val dash = DashPathEffect(floatArrayOf(dp(10f), dp(8f)), 0f)
+    private val dots = DashPathEffect(floatArrayOf(dp(3f), dp(7f)), 0f)
     private val txt = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
     private val path = Path()
     private val r2 = RectF()
     private val againBtn = RectF()
-    private val exitBtn = RectF()
+    private val menuBtn = RectF()
     private val closeBtn = RectF()
+    private val cards = Array(3) { RectF() }
+    private val stars = Array(46) { floatArrayOf(Random.nextFloat(), Random.nextFloat(), Random.nextFloat()) }
 
     private val orange = 0xFFFFA94D.toInt()
     private val red = 0xFFFF4D5E.toInt()
@@ -117,6 +203,7 @@ class DodgeView(context: Context, private val host: Host) : View(context) {
     private val pink = 0xFFF783AC.toInt()
     private val gold = 0xFFFFD54F.toInt()
     private val green = 0xFF7CF29C.toInt()
+    private val violet = 0xFF9D8CFF.toInt()
 
     private fun maxR() = hypot(width.toFloat(), height.toFloat())
     private fun now() = SystemClock.uptimeMillis()
@@ -177,25 +264,37 @@ class DodgeView(context: Context, private val host: Host) : View(context) {
     private fun startFill() {
         st = St.FILL
         fillCx = bx; fillCy = by
+        px = bx; py = by
         phaseStart = now()
         haptic(HapticFeedbackConstants.LONG_PRESS)
     }
 
+    private fun openMenu() {
+        sensors(false)
+        st = St.MENU
+        px = width / 2f; py = height / 2f
+    }
+
     private fun startPlay() {
         st = St.PLAY
-        hz.clear(); popups.clear()
-        px = width / 2f; py = height * 0.68f
-        if (fillCx > 0f) { px = fillCx; py = fillCy.coerceAtMost(height * 0.8f) }
-        pvx = 0f; pvy = 0f
-        gameT = 0f; bonus = 0; score = 0; newBest = false
-        nextMeteor = 0.8f; nextLaser = 4f; nextBouncer = 9f; nextChaser = 20f; nextStar = 2.5f
+        gameT = 0f
+        newBest = false
         lastFrame = now()
+        lookX = 0f; lookY = 0f
+        when (game) {
+            DODGE -> startDodge()
+            MAZE -> startMaze()
+            BALANCE -> startBalance()
+        }
+        needCal = true
+        sensors(game != DODGE)
     }
 
     fun close() {
         if (st == St.CLOSE || closed) return
         if (st == St.DROP) { px = bx; py = by }
         if (st == St.FILL) { px = fillCx; py = fillCy }
+        sensors(false)
         host.setDodgeTouchable(false)
         st = St.CLOSE
         phaseStart = now()
@@ -206,13 +305,37 @@ class DodgeView(context: Context, private val host: Host) : View(context) {
     fun kill() {
         if (closed) return
         closed = true
+        sensors(false)
         host.onDodgeClosed()
     }
 
     private fun finish() {
         if (closed) return
         closed = true
+        sensors(false)
         post { host.onDodgeClosed() }
+    }
+
+    override fun onDetachedFromWindow() {
+        sensors(false)
+        super.onDetachedFromWindow()
+    }
+
+    private fun die() {
+        if (st != St.PLAY) return
+        st = St.DEAD
+        deadAt = now()
+        haptic(HapticFeedbackConstants.LONG_PRESS)
+        val result = when (game) {
+            DODGE -> score
+            MAZE -> mLevel - 1
+            else -> (gameT * 10).toInt()
+        }
+        if (result > bests[game]) {
+            bests[game] = result
+            newBest = true
+            host.onBest(game, result)
+        }
     }
 
     // =====================================================================
@@ -235,9 +358,15 @@ class DodgeView(context: Context, private val host: Host) : View(context) {
             }
             St.DROP -> { stepDrop(dt, now); drawDrop(c, now) }
             St.FILL -> drawFill(c, now)
+            St.MENU -> { c.drawColor(bg); drawBackdrop(c, now); drawMenu(c, now); drawCloseBtn(c) }
             St.PLAY, St.DEAD, St.OVER -> {
-                if (st == St.PLAY) stepGame(dt)
-                if (st == St.DEAD && now - deadAt > 750L) st = St.OVER
+                if (st == St.PLAY) when (game) {
+                    DODGE -> stepDodge(dt)
+                    MAZE -> stepMaze(dt, now)
+                    BALANCE -> stepBalance(dt)
+                }
+                if (st == St.DEAD && game == BALANCE) stepFall(dt)
+                if (st == St.DEAD && now - deadAt > 800L) st = St.OVER
                 drawGame(c, now)
             }
             St.CLOSE -> if (!drawClose(c, now)) { finish(); return }
@@ -268,8 +397,7 @@ class DodgeView(context: Context, private val host: Host) : View(context) {
         c.drawPath(path, black)
         c.drawCircle(x, y0, R, black)
 
-        val ready = live && dist >= launchDist
-        if (ready) {
+        if (live && dist >= launchDist) {
             val pulse = 0.5f + 0.5f * sin(now() / 120f)
             paint.style = Paint.Style.STROKE
             paint.strokeWidth = dp(3f)
@@ -277,8 +405,8 @@ class DodgeView(context: Context, private val host: Host) : View(context) {
             paint.alpha = (140 + 115 * pulse).toInt()
             c.drawCircle(x, y0, R + dp(5f) + pulse * dp(3f), paint)
             paint.alpha = 255
+            paint.style = Paint.Style.FILL
         }
-        // eyes strain toward the camera while you pull
         val lx = ((pcx - x) / dp(120f)).coerceIn(-1f, 1f)
         drawEyes(c, x, y0, R, lx, -1f, wide = dist > launchDist * 0.6f)
     }
@@ -304,13 +432,9 @@ class DodgeView(context: Context, private val host: Host) : View(context) {
         }
     }
 
-    private fun squashAmount(now: Long): Float {
-        val t = (now - squashAt) / 160f
-        return if (t in 0f..1f) (1f - t) else 0f
-    }
-
     private fun drawDrop(c: Canvas, now: Long) {
-        val s = squashAmount(now) * 0.35f
+        val t = (now - squashAt) / 160f
+        val s = (if (t in 0f..1f) 1f - t else 0f) * 0.35f
         val rx = blobR * (1f + s)
         val ry = blobR * (1f - s)
         r2.set(bx - rx, by - ry * 2f + blobR, bx + rx, by + blobR)
@@ -327,17 +451,16 @@ class DodgeView(context: Context, private val host: Host) : View(context) {
         paint.style = Paint.Style.FILL
         paint.color = bg
         c.drawCircle(fillCx, fillCy, r, paint)
-        // white shock ring
         paint.style = Paint.Style.STROKE
         paint.strokeWidth = dp(4f) * (1f - f) + dp(1f)
         paint.color = Color.WHITE
         paint.alpha = ((1f - f) * 200).toInt()
         c.drawCircle(fillCx, fillCy, r, paint)
         paint.alpha = 255
-        // eyes pop big, then settle
+        paint.style = Paint.Style.FILL
         val pop = 1f + 1.2f * sin(f * Math.PI.toFloat())
         drawPlayerBody(c, fillCx, fillCy, pr * pop, 0f, 0f, false)
-        if (f >= 1f) startPlay()
+        if (f >= 1f) openMenu()
     }
 
     // ---------------- close ----------------
@@ -345,10 +468,8 @@ class DodgeView(context: Context, private val host: Host) : View(context) {
     private fun drawClose(c: Canvas, now: Long): Boolean {
         val f = ((now - phaseStart) / 430f).coerceIn(0f, 1f)
         val e = f * f
-        val tx = pill.centerX()
-        val ty = pill.centerY()
-        val cx = px + (tx - px) * e
-        val cy = py + (ty - py) * e
+        val cx = px + (pill.centerX() - px) * e
+        val cy = py + (pill.centerY() - py) * e
         val r = maxR() + (pill.height() / 2f - maxR()) * e
         paint.style = Paint.Style.FILL
         paint.color = bg
@@ -358,19 +479,97 @@ class DodgeView(context: Context, private val host: Host) : View(context) {
     }
 
     // =====================================================================
-    // the game
+    // menu
     // =====================================================================
 
-    private fun difficulty() = 1f + gameT / 25f
+    private val names = arrayOf("Dodge", "Tilt Maze", "Balance")
+    private val icons = arrayOf("🌠", "🌀", "⚖️")
+    private val blurbs = arrayOf("Drag to dodge everything", "Tilt to roll home to the camera", "Tilt to keep the blob on the beam")
+    private val accents get() = intArrayOf(orange, violet, cyan)
 
-    private fun stepGame(dt: Float) {
+    private fun bestLabel(g: Int): String {
+        val b = bests[g]
+        return when (g) {
+            DODGE -> "best $b"
+            MAZE -> "best lvl $b"
+            else -> String.format(Locale.US, "best %.1fs", b / 10f)
+        }
+    }
+
+    private fun drawMenu(c: Canvas, now: Long) {
+        val w = width.toFloat()
+        val h = height.toFloat()
+        // blob peeking above the cards
+        val bob = sin(now / 400f) * dp(4f)
+        drawPlayerBody(c, w / 2f, h * 0.27f + bob, pr * 1.6f, sin(now / 900f) * 0.6f, 0.3f, false)
+
+        txt.textAlign = Paint.Align.CENTER
+        txt.color = Color.WHITE
+        txt.typeface = Typeface.DEFAULT_BOLD
+        txt.textSize = dp(22f)
+        c.drawText("Pick a game", w / 2f, h * 0.27f + pr * 1.6f + dp(46f), txt)
+
+        val cw = min(w - dp(40f), dp(360f))
+        val ch = dp(76f)
+        var top = h * 0.27f + pr * 1.6f + dp(72f)
+        for (i in 0 until 3) {
+            val r = cards[i]
+            r.set(w / 2f - cw / 2f, top, w / 2f + cw / 2f, top + ch)
+            paint.style = Paint.Style.FILL
+            paint.color = 0xFF16161C.toInt()
+            c.drawRoundRect(r, dp(20f), dp(20f), paint)
+            paint.style = Paint.Style.STROKE
+            paint.strokeWidth = dp(1.5f)
+            paint.color = accents[i]
+            paint.alpha = 110
+            c.drawRoundRect(r, dp(20f), dp(20f), paint)
+            paint.alpha = 255
+            paint.style = Paint.Style.FILL
+
+            txt.textAlign = Paint.Align.CENTER
+            txt.textSize = dp(28f)
+            c.drawText(icons[i], r.left + dp(38f), r.centerY() + dp(10f), txt)
+            txt.textAlign = Paint.Align.LEFT
+            txt.typeface = Typeface.DEFAULT_BOLD
+            txt.textSize = dp(17f)
+            txt.color = Color.WHITE
+            c.drawText(names[i], r.left + dp(72f), r.centerY() - dp(4f), txt)
+            txt.typeface = Typeface.DEFAULT
+            txt.textSize = dp(12.5f)
+            txt.color = 0xFF9A9AA2.toInt()
+            c.drawText(blurbs[i], r.left + dp(72f), r.centerY() + dp(16f), txt)
+            txt.textAlign = Paint.Align.RIGHT
+            txt.color = accents[i]
+            txt.textSize = dp(12f)
+            c.drawText(bestLabel(i), r.right - dp(18f), r.top + dp(24f), txt)
+            top += ch + dp(14f)
+        }
+        txt.textAlign = Paint.Align.CENTER
+        txt.color = 0xFF6A6A72.toInt()
+        txt.textSize = dp(12f)
+        c.drawText("Tilt games: hold the phone comfortably — that's 'level'", w / 2f, top + dp(18f), txt)
+    }
+
+    // =====================================================================
+    // game 1: DODGE
+    // =====================================================================
+
+    private fun startDodge() {
+        hz.clear(); popups.clear()
+        px = if (fillCx > 0f) fillCx else width / 2f
+        py = height * 0.68f
+        pvx = 0f; pvy = 0f
+        bonus = 0; score = 0
+        nextMeteor = 0.8f; nextLaser = 4f; nextBouncer = 9f; nextChaser = 20f; nextStar = 2.5f
+    }
+
+    private fun stepDodge(dt: Float) {
         gameT += dt
         score = (gameT * 10).toInt() + bonus
-        val k = difficulty()
+        val k = 1f + gameT / 25f
         val w = width.toFloat()
         val h = height.toFloat()
 
-        // spawns
         if (gameT >= nextMeteor) {
             val r = dp(9f) + Random.nextFloat() * dp(13f)
             val speed = (dp(240f) + Random.nextFloat() * dp(150f)) * min(1.9f, 0.85f + 0.15f * k)
@@ -410,7 +609,6 @@ class DodgeView(context: Context, private val host: Host) : View(context) {
             nextStar = gameT + 3.5f
         }
 
-        // move + collide
         val hitR = pr * 0.78f
         for (o in hz) {
             o.age += dt
@@ -453,7 +651,6 @@ class DodgeView(context: Context, private val host: Host) : View(context) {
             if (hit) { die(); break }
         }
         hz.removeAll { it.dead }
-        // ease the eye-look toward movement
         lookX += ((pvx / dp(600f)).coerceIn(-1f, 1f) - lookX) * min(1f, dt * 10f)
         lookY += ((pvy / dp(600f)).coerceIn(-1f, 1f) - lookY) * min(1f, dt * 10f)
         pvx *= 0.85f; pvy *= 0.85f
@@ -465,41 +662,9 @@ class DodgeView(context: Context, private val host: Host) : View(context) {
         return dx * dx + dy * dy < rr * rr
     }
 
-    private fun die() {
-        st = St.DEAD
-        deadAt = now()
-        haptic(HapticFeedbackConstants.LONG_PRESS)
-        if (score > best) {
-            best = score
-            newBest = true
-            host.onDodgeBest(best)
-        }
-    }
-
-    // ---------------- drawing ----------------
-
-    private fun drawGame(c: Canvas, now: Long) {
-        val w = width.toFloat()
-        val h = height.toFloat()
-        c.drawColor(bg)
-
-        c.save()
-        val shake = if (st == St.DEAD) (1f - ((now - deadAt) / 320f)).coerceIn(0f, 1f) else 0f
-        if (shake > 0f) c.translate((Random.nextFloat() - 0.5f) * dp(16f) * shake, (Random.nextFloat() - 0.5f) * dp(16f) * shake)
-
-        // twinkling backdrop
-        paint.style = Paint.Style.FILL
-        for (s in stars) {
-            paint.color = Color.WHITE
-            paint.alpha = (30 + 60 * (0.5f + 0.5f * sin(now / 600f + s[2] * 20f))).toInt()
-            c.drawCircle(s[0] * w, (s[1] * h + gameT * dp(12f) * (0.5f + s[2])) % h, dp(1.2f) + s[2] * dp(1f), paint)
-        }
-        paint.alpha = 255
-
-        for (o in hz) drawHazard(c, o, now)
+    private fun drawDodge(c: Canvas, now: Long) {
+        for (o in hz) drawHazard(c, o)
         drawPlayerBody(c, px, py, pr, lookX, lookY, st != St.PLAY)
-
-        // "+50" popups
         txt.textAlign = Paint.Align.CENTER
         txt.textSize = dp(16f)
         txt.typeface = Typeface.DEFAULT_BOLD
@@ -511,49 +676,12 @@ class DodgeView(context: Context, private val host: Host) : View(context) {
             c.drawText("+50", p.first, p.second - f * dp(30f), txt)
         }
         txt.alpha = 255
-        c.restore()
-
-        // HUD (kept clear of the camera in the middle)
-        txt.textAlign = Paint.Align.LEFT
-        txt.color = Color.WHITE
-        txt.typeface = Typeface.create("sans-serif-light", Typeface.NORMAL)
-        txt.textSize = dp(34f)
-        c.drawText("$score", dp(22f), dp(84f), txt)
-        txt.typeface = Typeface.DEFAULT
-        txt.textSize = dp(12f)
-        txt.color = 0xFF8A8A92.toInt()
-        c.drawText(String.format(Locale.US, "%.1fs  •  best %d", gameT, best), dp(24f), dp(104f), txt)
-
-        // close button
-        closeBtn.set(w - dp(64f), dp(52f), w - dp(20f), dp(96f))
-        paint.color = 0xFF1E1E26.toInt()
-        c.drawCircle(closeBtn.centerX(), closeBtn.centerY(), dp(20f), paint)
-        paint.style = Paint.Style.STROKE
-        paint.strokeWidth = dp(2.2f)
-        paint.strokeCap = Paint.Cap.ROUND
-        paint.color = Color.WHITE
-        val k = dp(6f)
-        c.drawLine(closeBtn.centerX() - k, closeBtn.centerY() - k, closeBtn.centerX() + k, closeBtn.centerY() + k, paint)
-        c.drawLine(closeBtn.centerX() - k, closeBtn.centerY() + k, closeBtn.centerX() + k, closeBtn.centerY() - k, paint)
-        paint.strokeCap = Paint.Cap.BUTT
-        paint.style = Paint.Style.FILL
-
-        if (st == St.PLAY && gameT < 3f) {
-            txt.textAlign = Paint.Align.CENTER
-            txt.color = Color.WHITE
-            txt.alpha = (((3f - gameT) / 1f).coerceIn(0f, 1f) * 255).toInt()
-            txt.textSize = dp(15f)
-            c.drawText("Drag anywhere to move  •  dodge everything", w / 2f, h - dp(70f), txt)
-            txt.alpha = 255
-        }
-
-        if (st == St.OVER) drawOver(c, w, h)
     }
 
-    private fun drawHazard(c: Canvas, o: Hz, now: Long) {
+    private fun drawHazard(c: Canvas, o: Hz) {
         paint.style = Paint.Style.FILL
         when (o.type) {
-            0 -> { // meteor with trail
+            0 -> {
                 val len = sqrt(o.vx * o.vx + o.vy * o.vy).coerceAtLeast(1f)
                 for (i in 3 downTo 1) {
                     paint.color = orange
@@ -566,7 +694,7 @@ class DodgeView(context: Context, private val host: Host) : View(context) {
                 paint.color = 0xFFFFE0B2.toInt()
                 c.drawCircle(o.x - o.r * 0.3f, o.y - o.r * 0.3f, o.r * 0.35f, paint)
             }
-            1 -> { // laser: warn, then fire
+            1 -> {
                 val w = width.toFloat(); val h = height.toFloat()
                 if (o.age < 0.9f) {
                     paint.style = Paint.Style.STROKE
@@ -583,14 +711,13 @@ class DodgeView(context: Context, private val host: Host) : View(context) {
                     val t = o.r * (0.7f + 0.3f * f)
                     if (o.horiz) c.drawRect(0f, o.y - t, w, o.y + t, paint) else c.drawRect(o.x - t, 0f, o.x + t, h, paint)
                     paint.color = Color.WHITE
-                    paint.alpha = 255
                     val ct = t * 0.3f
                     if (o.horiz) c.drawRect(0f, o.y - ct, w, o.y + ct, paint) else c.drawRect(o.x - ct, 0f, o.x + ct, h, paint)
                 }
                 paint.alpha = 255
                 paint.style = Paint.Style.FILL
             }
-            2 -> { // bouncer
+            2 -> {
                 val fade = ((o.life - o.age) / 0.6f).coerceIn(0f, 1f)
                 paint.color = cyan
                 paint.alpha = (70 * fade).toInt()
@@ -602,7 +729,7 @@ class DodgeView(context: Context, private val host: Host) : View(context) {
                 paint.alpha = 255
                 paint.style = Paint.Style.FILL
             }
-            3 -> { // homing chaser
+            3 -> {
                 val ang = atan2(o.vy, o.vx)
                 val fade = ((o.life - o.age) / 0.4f).coerceIn(0f, 1f) * (o.age / 0.3f).coerceIn(0f, 1f)
                 paint.color = pink
@@ -619,36 +746,427 @@ class DodgeView(context: Context, private val host: Host) : View(context) {
                 c.drawPath(path, paint)
                 paint.alpha = 255
             }
-            4 -> { // star
-                val rot = o.age * 2f
-                path.reset()
-                for (i in 0 until 10) {
-                    val a = rot + i * 0.6283f - 1.5708f
-                    val rr = if (i % 2 == 0) o.r else o.r * 0.45f
-                    val x = o.x + cos(a) * rr
-                    val y = o.y + sin(a) * rr
-                    if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
-                }
-                path.close()
-                paint.color = gold
-                c.drawPath(path, paint)
-            }
+            4 -> drawStar(c, o.x, o.y, o.r, o.age * 2f, gold)
         }
     }
 
-    private fun drawPlayerBody(c: Canvas, x: Float, y: Float, r: Float, lx: Float, ly: Float, dead: Boolean) {
+    private fun drawStar(c: Canvas, x0: Float, y0: Float, r: Float, rot: Float, color: Int) {
+        path.reset()
+        for (i in 0 until 10) {
+            val a = rot + i * 0.6283f - 1.5708f
+            val rr = if (i % 2 == 0) r else r * 0.45f
+            val x = x0 + cos(a) * rr
+            val y = y0 + sin(a) * rr
+            if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+        }
+        path.close()
+        paint.style = Paint.Style.FILL
+        paint.color = color
+        c.drawPath(path, paint)
+    }
+
+    // =====================================================================
+    // game 2: TILT MAZE — roll the blob back up into the camera
+    // =====================================================================
+
+    private fun startMaze() {
+        mLevel = 1
+        buildMaze()
+    }
+
+    private fun mazeBallR() = mCell * 0.27f
+
+    private fun buildMaze() {
+        val w = width.toFloat()
+        val h = height.toFloat()
+        mCols = min(4 + mLevel, 10)
+        val top = dp(150f)
+        val bottom = h - dp(36f)
+        mCell = (w - dp(28f)) / mCols
+        mRows = max(5, floor((bottom - top) / mCell).toInt())
+        mLeft = (w - mCols * mCell) / 2f
+        mTop = top + ((bottom - top) - mRows * mCell) / 2f
+        mGoalCol = mCols / 2
+
+        // all walls up, then carve with a depth-first search
+        mWallsH = Array(mRows + 1) { BooleanArray(mCols) { true } }
+        mWallsV = Array(mRows) { BooleanArray(mCols + 1) { true } }
+        val seen = Array(mRows) { BooleanArray(mCols) }
+        val stack = ArrayList<Int>()
+        val start = (mRows - 1) * mCols + mGoalCol
+        seen[mRows - 1][mGoalCol] = true
+        stack.add(start)
+        val dirs = intArrayOf(0, 1, 2, 3)
+        while (stack.isNotEmpty()) {
+            val cur = stack[stack.size - 1]
+            val r = cur / mCols
+            val cc = cur % mCols
+            dirs.shuffle()
+            var moved = false
+            for (d in dirs) {
+                val nr = r + when (d) { 0 -> -1; 1 -> 1; else -> 0 }
+                val nc = cc + when (d) { 2 -> -1; 3 -> 1; else -> 0 }
+                if (nr !in 0 until mRows || nc !in 0 until mCols || seen[nr][nc]) continue
+                when (d) {
+                    0 -> mWallsH[r][cc] = false
+                    1 -> mWallsH[r + 1][cc] = false
+                    2 -> mWallsV[r][cc] = false
+                    3 -> mWallsV[r][cc + 1] = false
+                }
+                seen[nr][nc] = true
+                stack.add(nr * mCols + nc)
+                moved = true
+                break
+            }
+            if (!moved) stack.removeAt(stack.size - 1)
+        }
+        mWallsH[0][mGoalCol] = false // the exit, right under the camera
+
+        val t = dp(4f)
+        mWalls.clear()
+        for (r in 0..mRows) for (cc in 0 until mCols) if (mWallsH[r][cc]) {
+            val y = mTop + r * mCell
+            mWalls.add(RectF(mLeft + cc * mCell - t / 2, y - t / 2, mLeft + (cc + 1) * mCell + t / 2, y + t / 2))
+        }
+        for (r in 0 until mRows) for (cc in 0..mCols) if (mWallsV[r][cc]) {
+            val x = mLeft + cc * mCell
+            mWalls.add(RectF(x - t / 2, mTop + r * mCell - t / 2, x + t / 2, mTop + (r + 1) * mCell + t / 2))
+        }
+
+        px = mLeft + (mGoalCol + 0.5f) * mCell
+        py = mTop + (mRows - 0.5f) * mCell
+        mVx = 0f; mVy = 0f
+        mTimeLeft = 25f + mRows * mCols / 4f
+        mClearAt = 0L
+    }
+
+    private fun stepMaze(dt: Float, now: Long) {
+        if (mClearAt > 0L) {
+            // ball flies up into the camera, then the next level
+            px += (pill.centerX() - px) * min(1f, dt * 6f)
+            py += (pill.centerY() - py) * min(1f, dt * 6f)
+            if (now - mClearAt > 900L) {
+                mLevel++
+                buildMaze()
+                needCal = true
+            }
+            return
+        }
+        gameT += dt
+        mTimeLeft -= dt
+        if (mTimeLeft <= 0f) { mTimeLeft = 0f; die(); return }
+
+        val acc = dp(260f)
+        mVx += tiltX() * acc * dt
+        mVy += tiltY() * acc * dt
+        val damp = 1f - min(0.9f, 1.2f * dt)
+        mVx *= damp; mVy *= damp
+        val maxV = dp(650f)
+        val sp = hypot(mVx, mVy)
+        if (sp > maxV) { mVx *= maxV / sp; mVy *= maxV / sp }
+
+        val r = mazeBallR()
+        val steps = 4
+        for (s in 0 until steps) {
+            px += mVx * dt / steps
+            py += mVy * dt / steps
+            for (wr in mWalls) {
+                val cx = px.coerceIn(wr.left, wr.right)
+                val cy = py.coerceIn(wr.top, wr.bottom)
+                val dx = px - cx
+                val dy = py - cy
+                val d2 = dx * dx + dy * dy
+                if (d2 < r * r && d2 > 1e-4f) {
+                    val d = sqrt(d2)
+                    val nx = dx / d
+                    val ny = dy / d
+                    px = cx + nx * r
+                    py = cy + ny * r
+                    val vn = mVx * nx + mVy * ny
+                    if (vn < 0f) {
+                        mVx -= 1.35f * vn * nx
+                        mVy -= 1.35f * vn * ny
+                        if (-vn > dp(180f) && now - mLastBump > 120L) {
+                            haptic(HapticFeedbackConstants.KEYBOARD_TAP)
+                            mLastBump = now
+                        }
+                    }
+                }
+            }
+        }
+        px = px.coerceIn(mLeft + r, mLeft + mCols * mCell - r)
+        py = py.coerceIn(mTop - mCell, mTop + mRows * mCell - r)
+
+        lookX += ((mVx / dp(400f)).coerceIn(-1f, 1f) - lookX) * min(1f, dt * 8f)
+        lookY += ((mVy / dp(400f)).coerceIn(-1f, 1f) - lookY) * min(1f, dt * 8f)
+
+        // reached the exit under the camera?
+        if (py < mTop - r * 0.2f) {
+            mClearAt = now
+            haptic(HapticFeedbackConstants.LONG_PRESS)
+        }
+    }
+
+    private fun drawMaze(c: Canvas, now: Long) {
+        // dotted trail from the exit up to the camera
+        val gx = mLeft + (mGoalCol + 0.5f) * mCell
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = dp(2.5f)
+        paint.strokeCap = Paint.Cap.ROUND
+        paint.pathEffect = dots
+        paint.color = green
+        paint.alpha = (120 + 100 * (0.5f + 0.5f * sin(now / 250f))).toInt()
+        c.drawLine(gx, mTop, pill.centerX(), pill.bottom + dp(6f), paint)
+        paint.pathEffect = null
+        // exit glow
+        paint.style = Paint.Style.FILL
+        paint.alpha = 50
+        c.drawCircle(gx, mTop + mCell * 0.5f, mCell * 0.42f, paint)
+        paint.alpha = 255
+
+        // walls
+        paint.style = Paint.Style.FILL
+        paint.color = violet
+        for (wr in mWalls) c.drawRoundRect(wr, dp(2f), dp(2f), paint)
+        paint.strokeCap = Paint.Cap.BUTT
+
+        val r = mazeBallR()
+        val scale = if (mClearAt > 0L) (1f - (now - mClearAt) / 900f).coerceIn(0.2f, 1f) else 1f
+        drawPlayerBody(c, px, py, r * scale, lookX, lookY, st == St.DEAD || st == St.OVER)
+
+        if (mClearAt > 0L) {
+            txt.textAlign = Paint.Align.CENTER
+            txt.typeface = Typeface.DEFAULT_BOLD
+            txt.textSize = dp(26f)
+            txt.color = green
+            c.drawText("Level $mLevel ✓", width / 2f, height / 2f, txt)
+        }
+    }
+
+    // =====================================================================
+    // game 3: BALANCE — keep the blob on a tilting beam
+    // =====================================================================
+
+    private fun beamLen() = width * (0.82f - min(0.42f, gameT / 120f))
+    private fun beamCx() = width / 2f
+    private fun beamCy() = height * 0.6f
+
+    private fun startBalance() {
+        bAngle = 0f; bS = 0f; bV = 0f
+        bWind = 0f; bWindTarget = 0f
+        bNextGust = 3f; bGustEnd = 0f
+        placeBalanceBall()
+    }
+
+    private fun stepBalance(dt: Float) {
+        gameT += dt
+        val k = 1f + gameT / 30f
+        // phone tilt + a little wobble that grows over time
+        val wobble = sin(gameT * 1.7f) * 0.05f * min(2f, k - 0.6f)
+        bAngle = (tiltX() * 0.085f + wobble).coerceIn(-0.6f, 0.6f)
+
+        if (gameT >= bNextGust) {
+            bWindTarget = (if (Random.nextBoolean()) 1f else -1f) * dp(260f + Random.nextFloat() * 260f) * min(2.2f, k)
+            bGustEnd = gameT + 1.2f + Random.nextFloat()
+            bNextGust = bGustEnd + max(1.2f, 4.5f / k) + Random.nextFloat() * 2f
+        }
+        if (gameT > bGustEnd) bWindTarget = 0f
+        bWind += (bWindTarget - bWind) * min(1f, dt * 3f)
+
+        val g = dp(1700f)
+        bV += (g * sin(bAngle) + bWind) * dt
+        bV *= 1f - min(0.5f, 0.35f * dt)
+        bS += bV * dt
+        placeBalanceBall()
+
+        lookX += ((bV / dp(300f)).coerceIn(-1f, 1f) - lookX) * min(1f, dt * 8f)
+        lookY = 0.4f
+        if (abs(bS) > beamLen() / 2f + pr * 0.2f) {
+            bFallX = px; bFallY = py
+            bFallVx = bV * cos(bAngle)
+            bFallVy = bV * sin(bAngle)
+            die()
+        }
+    }
+
+    private fun placeBalanceBall() {
+        val ca = cos(bAngle)
+        val sa = sin(bAngle)
+        val lift = pr + dp(5f)
+        px = beamCx() + ca * bS + sa * lift
+        py = beamCy() + sa * bS - ca * lift
+    }
+
+    private fun stepFall(dt: Float) {
+        bFallVy += dp(2400f) * dt
+        bFallX += bFallVx * dt
+        bFallY += bFallVy * dt
+        px = bFallX; py = bFallY
+    }
+
+    private fun drawBalance(c: Canvas, now: Long) {
+        val w = width.toFloat()
+        // wind streaks
+        if (abs(bWind) > dp(30f)) {
+            val dir = if (bWind > 0) 1f else -1f
+            val strength = (abs(bWind) / dp(600f)).coerceIn(0f, 1f)
+            paint.style = Paint.Style.STROKE
+            paint.strokeWidth = dp(2f)
+            paint.strokeCap = Paint.Cap.ROUND
+            paint.color = Color.WHITE
+            for (s in windStreaks) {
+                val speed = dp(500f) + s[2] * dp(400f)
+                val len = dp(30f) + s[2] * dp(40f)
+                val x = ((s[0] * w + dir * now / 1000f * speed) % (w + len) + (w + len)) % (w + len) - len / 2
+                val y = dp(160f) + s[1] * (height - dp(260f))
+                paint.alpha = (strength * 120 * (0.4f + s[2])).toInt().coerceAtMost(255)
+                c.drawLine(x, y, x - dir * len, y, paint)
+            }
+            paint.alpha = 255
+            paint.strokeCap = Paint.Cap.BUTT
+            // arrow hint
+            txt.textAlign = Paint.Align.CENTER
+            txt.textSize = dp(28f)
+            txt.color = Color.WHITE
+            txt.alpha = (120 + 135 * strength).toInt().coerceAtMost(255)
+            c.drawText(if (dir > 0) "💨→" else "←💨", w / 2f, dp(170f), txt)
+            txt.alpha = 255
+        }
+
+        // pivot
+        val cx = beamCx()
+        val cy = beamCy()
+        paint.style = Paint.Style.FILL
+        paint.color = 0xFF2A2A33.toInt()
+        path.reset()
+        path.moveTo(cx, cy + dp(4f))
+        path.lineTo(cx - dp(26f), cy + dp(46f))
+        path.lineTo(cx + dp(26f), cy + dp(46f))
+        path.close()
+        c.drawPath(path, paint)
+
+        // beam
+        val half = beamLen() / 2f
+        val ca = cos(bAngle)
+        val sa = sin(bAngle)
+        paint.style = Paint.Style.STROKE
+        paint.strokeCap = Paint.Cap.ROUND
+        paint.strokeWidth = dp(10f)
+        paint.color = cyan
+        c.drawLine(cx - ca * half, cy - sa * half, cx + ca * half, cy + sa * half, paint)
+        paint.strokeWidth = dp(3f)
+        paint.color = Color.WHITE
+        paint.alpha = 140
+        c.drawLine(cx - ca * half * 0.96f, cy - sa * half * 0.96f - dp(2f), cx + ca * half * 0.96f, cy + sa * half * 0.96f - dp(2f), paint)
+        paint.alpha = 255
+        paint.strokeCap = Paint.Cap.BUTT
+        // danger ends
+        paint.style = Paint.Style.FILL
+        paint.color = red
+        c.drawCircle(cx - ca * half, cy - sa * half, dp(6f), paint)
+        c.drawCircle(cx + ca * half, cy + sa * half, dp(6f), paint)
+
+        val edge = (abs(bS) / half).coerceIn(0f, 1f)
+        drawPlayerBody(c, px, py, pr, lookX, lookY, st != St.PLAY, wide = edge > 0.7f)
+    }
+
+    // =====================================================================
+    // shared drawing
+    // =====================================================================
+
+    private fun drawBackdrop(c: Canvas, now: Long) {
+        val w = width.toFloat()
+        val h = height.toFloat()
+        paint.style = Paint.Style.FILL
+        for (s in stars) {
+            paint.color = Color.WHITE
+            paint.alpha = (30 + 60 * (0.5f + 0.5f * sin(now / 600f + s[2] * 20f))).toInt()
+            c.drawCircle(s[0] * w, (s[1] * h + gameT * dp(12f) * (0.5f + s[2])) % h, dp(1.2f) + s[2] * dp(1f), paint)
+        }
+        paint.alpha = 255
+    }
+
+    private fun drawGame(c: Canvas, now: Long) {
+        val w = width.toFloat()
+        val h = height.toFloat()
+        c.drawColor(bg)
+
+        c.save()
+        val shake = if (st == St.DEAD) (1f - ((now - deadAt) / 320f)).coerceIn(0f, 1f) else 0f
+        if (shake > 0f) c.translate((Random.nextFloat() - 0.5f) * dp(16f) * shake, (Random.nextFloat() - 0.5f) * dp(16f) * shake)
+        drawBackdrop(c, now)
+        when (game) {
+            DODGE -> drawDodge(c, now)
+            MAZE -> drawMaze(c, now)
+            BALANCE -> drawBalance(c, now)
+        }
+        c.restore()
+
+        // HUD (left side, clear of the camera)
+        val (big, small) = when (game) {
+            DODGE -> "$score" to String.format(Locale.US, "%.1fs  •  best %d", gameT, bests[DODGE])
+            MAZE -> "Level $mLevel" to String.format(Locale.US, "%.0fs left  •  best lvl %d", ceilPos(mTimeLeft), bests[MAZE])
+            else -> String.format(Locale.US, "%.1fs", gameT) to String.format(Locale.US, "best %.1fs", bests[BALANCE] / 10f)
+        }
+        txt.textAlign = Paint.Align.LEFT
+        txt.color = if (game == MAZE && mTimeLeft < 6f && st == St.PLAY) red else Color.WHITE
+        txt.typeface = Typeface.create("sans-serif-light", Typeface.NORMAL)
+        txt.textSize = dp(32f)
+        c.drawText(big, dp(22f), dp(84f), txt)
+        txt.typeface = Typeface.DEFAULT
+        txt.textSize = dp(12f)
+        txt.color = 0xFF8A8A92.toInt()
+        c.drawText(small, dp(24f), dp(104f), txt)
+
+        if (st == St.PLAY && gameT < 3f) {
+            val hint = when (game) {
+                DODGE -> "Drag anywhere to move  •  dodge everything"
+                MAZE -> "Tilt to roll  •  get back up into the camera"
+                else -> "Tilt left / right  •  don't fall off"
+            }
+            txt.textAlign = Paint.Align.CENTER
+            txt.color = Color.WHITE
+            txt.alpha = ((3f - gameT).coerceIn(0f, 1f) * 255).toInt()
+            txt.textSize = dp(15f)
+            c.drawText(hint, w / 2f, h - dp(60f), txt)
+            txt.alpha = 255
+        }
+
+        if (st == St.OVER) drawOver(c, w, h)
+        drawCloseBtn(c)
+    }
+
+    private fun ceilPos(v: Float) = kotlin.math.ceil(max(0f, v))
+
+    private fun drawCloseBtn(c: Canvas) {
+        val w = width.toFloat()
+        closeBtn.set(w - dp(64f), dp(52f), w - dp(20f), dp(96f))
+        paint.style = Paint.Style.FILL
+        paint.color = 0xFF1E1E26.toInt()
+        c.drawCircle(closeBtn.centerX(), closeBtn.centerY(), dp(20f), paint)
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = dp(2.2f)
+        paint.strokeCap = Paint.Cap.ROUND
+        paint.color = Color.WHITE
+        val k = dp(6f)
+        c.drawLine(closeBtn.centerX() - k, closeBtn.centerY() - k, closeBtn.centerX() + k, closeBtn.centerY() + k, paint)
+        c.drawLine(closeBtn.centerX() - k, closeBtn.centerY() + k, closeBtn.centerX() + k, closeBtn.centerY() - k, paint)
+        paint.strokeCap = Paint.Cap.BUTT
+        paint.style = Paint.Style.FILL
+    }
+
+    private fun drawPlayerBody(c: Canvas, x: Float, y: Float, r: Float, lx: Float, ly: Float, dead: Boolean, wide: Boolean = false) {
         paint.style = Paint.Style.FILL
         paint.color = 0xFF202028.toInt()
         c.drawCircle(x, y, r, paint)
         paint.style = Paint.Style.STROKE
-        paint.strokeWidth = dp(2f)
+        paint.strokeWidth = max(dp(1.2f), r * 0.1f)
         paint.color = Color.WHITE
         c.drawCircle(x, y, r, paint)
         paint.style = Paint.Style.FILL
-        drawEyes(c, x, y, r, lx, ly, wide = false, dead = dead)
+        drawEyes(c, x, y, r, lx, ly, wide = wide, dead = dead)
     }
 
-    /** Two white eyes centred on (cx, cy), sized for a blob of radius [size]. */
     private fun drawEyes(c: Canvas, cx: Float, cy: Float, size: Float, lx: Float, ly: Float, wide: Boolean, dead: Boolean = false) {
         val off = size * 0.4f
         val er = size * (if (wide) 0.34f else 0.28f)
@@ -682,32 +1200,48 @@ class DodgeView(context: Context, private val host: Host) : View(context) {
         paint.color = 0xFF16161C.toInt()
         c.drawRoundRect(r2, dp(24f), dp(24f), paint)
 
+        val title = when {
+            newBest -> "New best! 🎉"
+            game == MAZE -> "Time's up!"
+            game == BALANCE -> "Whoops!"
+            else -> "Splat!"
+        }
+        val big = when (game) {
+            DODGE -> "$score"
+            MAZE -> "${mLevel - 1}"
+            else -> String.format(Locale.US, "%.1fs", gameT)
+        }
+        val sub = when (game) {
+            DODGE -> String.format(Locale.US, "survived %.1fs  •  best %d", gameT, bests[DODGE])
+            MAZE -> "levels cleared  •  best ${bests[MAZE]}"
+            else -> String.format(Locale.US, "balanced  •  best %.1fs", bests[BALANCE] / 10f)
+        }
         txt.textAlign = Paint.Align.CENTER
         txt.color = Color.WHITE
         txt.typeface = Typeface.DEFAULT_BOLD
         txt.textSize = dp(22f)
-        c.drawText(if (newBest) "New best! 🎉" else "Splat!", w / 2f, r2.top + dp(48f), txt)
+        c.drawText(title, w / 2f, r2.top + dp(48f), txt)
         txt.typeface = Typeface.create("sans-serif-light", Typeface.NORMAL)
         txt.textSize = dp(46f)
-        c.drawText("$score", w / 2f, r2.top + dp(108f), txt)
+        c.drawText(big, w / 2f, r2.top + dp(108f), txt)
         txt.typeface = Typeface.DEFAULT
         txt.textSize = dp(13f)
         txt.color = 0xFFA8A8B0.toInt()
-        c.drawText(String.format(Locale.US, "survived %.1fs  •  best %d", gameT, best), w / 2f, r2.top + dp(134f), txt)
+        c.drawText(sub, w / 2f, r2.top + dp(134f), txt)
 
         val bw = (cw - dp(48f)) / 2f
         againBtn.set(r2.left + dp(16f), r2.bottom - dp(76f), r2.left + dp(16f) + bw, r2.bottom - dp(24f))
-        exitBtn.set(againBtn.right + dp(16f), againBtn.top, againBtn.right + dp(16f) + bw, againBtn.bottom)
+        menuBtn.set(againBtn.right + dp(16f), againBtn.top, againBtn.right + dp(16f) + bw, againBtn.bottom)
         paint.color = Color.WHITE
         c.drawRoundRect(againBtn, dp(16f), dp(16f), paint)
         paint.color = 0xFF2A2A33.toInt()
-        c.drawRoundRect(exitBtn, dp(16f), dp(16f), paint)
+        c.drawRoundRect(menuBtn, dp(16f), dp(16f), paint)
         txt.textSize = dp(15f)
         txt.typeface = Typeface.DEFAULT_BOLD
         txt.color = Color.BLACK
         c.drawText("Play again", againBtn.centerX(), againBtn.centerY() + dp(5f), txt)
         txt.color = Color.WHITE
-        c.drawText("Exit", exitBtn.centerX(), exitBtn.centerY() + dp(5f), txt)
+        c.drawText("Games", menuBtn.centerX(), menuBtn.centerY() + dp(5f), txt)
     }
 
     // =====================================================================
@@ -718,12 +1252,22 @@ class DodgeView(context: Context, private val host: Host) : View(context) {
     override fun onTouchEvent(e: MotionEvent): Boolean {
         val x = e.x
         val y = e.y
+        if (e.actionMasked == MotionEvent.ACTION_DOWN && st != St.CLOSE && hitClose(x, y)) {
+            haptic()
+            close()
+            return true
+        }
         when (st) {
-            St.PLAY -> when (e.actionMasked) {
-                MotionEvent.ACTION_DOWN -> {
-                    if (hitClose(x, y)) { close(); return true }
-                    lastTouchX = x; lastTouchY = y
+            St.MENU -> if (e.actionMasked == MotionEvent.ACTION_UP) {
+                for (i in 0 until 3) if (cards[i].contains(x, y)) {
+                    haptic()
+                    game = i
+                    startPlay()
+                    break
                 }
+            }
+            St.PLAY -> if (game == DODGE) when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> { lastTouchX = x; lastTouchY = y }
                 MotionEvent.ACTION_MOVE -> {
                     val dx = (x - lastTouchX) * 1.25f
                     val dy = (y - lastTouchY) * 1.25f
@@ -737,10 +1281,9 @@ class DodgeView(context: Context, private val host: Host) : View(context) {
             St.OVER -> if (e.actionMasked == MotionEvent.ACTION_UP) {
                 when {
                     againBtn.contains(x, y) -> { haptic(); fillCx = 0f; startPlay() }
-                    exitBtn.contains(x, y) || hitClose(x, y) -> { haptic(); close() }
+                    menuBtn.contains(x, y) -> { haptic(); openMenu() }
                 }
             }
-            St.DEAD, St.DROP, St.FILL -> if (e.actionMasked == MotionEvent.ACTION_DOWN && hitClose(x, y)) close()
             else -> {}
         }
         return true

@@ -110,8 +110,8 @@ class MainActivity : Activity() {
                     "• Swipe sideways in big view → music ↔ controls\n" +
                     "• Swipe down on pill → open  •  Swipe up → close\n" +
                     "• Any app using the camera → green ring spins around it\n" +
-                    "• Pull the pill down far → eyes stretch; let go → full-screen dodge game\n" +
-                    "   (or tap 🎮 Game in the big view). Drag to move, ✕ to exit\n" +
+                    "• Pull the pill down far → eyes stretch; let go → it splats into the game menu\n" +
+                    "   (or tap 🎮 Game in the big view). Games: Dodge, Tilt Maze, Balance. ✕ to exit\n" +
                     "• Double-tap pill → pet eyes on/off\n" +
                     "• Pet: tilt the phone → it looks around; shake → dizzy;\n   after 11pm it sleeps and wakes when you pick it up;\n   happy while charging, sleepy below 15% battery\n" +
                     "• Long-press pill → this screen\n" +

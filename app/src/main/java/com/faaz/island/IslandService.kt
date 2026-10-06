@@ -142,7 +142,7 @@ class IslandService : AccessibilityService(), IslandView.Host, DodgeView.Host {
     // ---------------- settings ----------------
 
     private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
-        if (ready && key != Prefs.DODGE_BEST) applyPrefs(true)
+        if (ready && key !in Prefs.BEST_KEYS) applyPrefs(true)
     }
 
     private fun applyPrefs(update: Boolean) {
@@ -626,7 +626,7 @@ class IslandService : AccessibilityService(), IslandView.Host, DodgeView.Host {
             }
         }
         val v = DodgeView(this, this)
-        v.best = prefs.getInt(Prefs.DODGE_BEST, 0)
+        for (i in 0 until 3) v.bests[i] = prefs.getInt(Prefs.BEST_KEYS[i], 0)
         v.setPill(pillRect())
         return try {
             wm.addView(v, p)
@@ -655,8 +655,8 @@ class IslandService : AccessibilityService(), IslandView.Host, DodgeView.Host {
         try { wm.removeView(v) } catch (e: Exception) {}
     }
 
-    override fun onDodgeBest(best: Int) {
-        prefs.edit().putInt(Prefs.DODGE_BEST, best).apply()
+    override fun onBest(game: Int, best: Int) {
+        prefs.edit().putInt(Prefs.BEST_KEYS[game], best).apply()
     }
 
     override fun setDodgeTouchable(touchable: Boolean) {

@@ -25,6 +25,9 @@ object Prefs {
     const val GLOW = "glow"
     const val PERM_TS = "perm_ts"
     const val DODGE_BEST = "dodge_best"
+    const val MAZE_BEST = "maze_best"
+    const val BALANCE_BEST = "balance_best"
+    val BEST_KEYS = arrayOf(DODGE_BEST, MAZE_BEST, BALANCE_BEST)
 }
 
 fun Drawable.toBmp(size: Int): Bitmap {
