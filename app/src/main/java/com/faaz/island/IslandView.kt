@@ -51,7 +51,7 @@ data class Alert(
     enum class Kind { NOTIFICATION, CHARGING, TIMER_DONE }
 }
 
-enum class Action { OPEN_ALERT, TORCH, TIMER_1, TIMER_5, TIMER_STOP, EYES, PLAY_PAUSE, NEXT, PREV, SETTINGS }
+enum class Action { OPEN_ALERT, TORCH, TIMER_1, TIMER_5, TIMER_STOP, EYES, PLAY_PAUSE, NEXT, PREV, SETTINGS, GAME }
 
 @SuppressLint("ViewConstructor")
 class IslandView(context: Context, private val host: Host) : View(context) {
@@ -60,6 +60,10 @@ class IslandView(context: Context, private val host: Host) : View(context) {
         fun resizeWindow(w: Int, h: Int)
         fun onAction(action: Action, alert: Alert?)
         fun onTimerDone()
+        fun pullStart(x: Float, y: Float)
+        fun pullMove(x: Float, y: Float)
+        /** @return true if the full-screen game launched */
+        fun pullEnd(x: Float, y: Float): Boolean
     }
 
     private enum class Mode { IDLE, LIVE, ALERT, EXPANDED }
@@ -160,6 +164,10 @@ class IslandView(context: Context, private val host: Host) : View(context) {
     private val zP = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE; typeface = Typeface.DEFAULT_BOLD
     }
+    private var downX = 0f
+    private var downY = 0f
+    private var pulling = false
+    private var pullPossible = false
     private val rect = RectF()
     private val r2 = RectF()
     private val path = Path()
@@ -690,6 +698,7 @@ class IslandView(context: Context, private val host: Host) : View(context) {
             Triple("🔦", "Torch", Action.TORCH) to torchOn,
             Triple("⏱", "+1 min", Action.TIMER_1) to false,
             Triple("⏳", "+5 min", Action.TIMER_5) to false,
+            Triple("🎮", "Game", Action.GAME) to false,
             (if (stop) Triple("✋", "Stop timer", Action.TIMER_STOP)
             else Triple("👀", if (eyes) "Eyes off" else "Eyes", Action.EYES)) to (eyes && !stop)
         )
@@ -877,6 +886,45 @@ class IslandView(context: Context, private val host: Host) : View(context) {
         if (event.actionMasked == MotionEvent.ACTION_OUTSIDE) {
             collapse()
             return false
+        }
+        // ---- pull the eyes down → full-screen game ----
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                downX = event.rawX; downY = event.rawY
+                pulling = false
+                pullPossible = mode == Mode.IDLE || mode == Mode.LIVE
+            }
+            MotionEvent.ACTION_MOVE -> if (pullPossible && !pulling) {
+                val dy = event.rawY - downY
+                val dx = abs(event.rawX - downX)
+                if (dy > dp(14f) && dy > dx) {
+                    pulling = true
+                    val cancel = MotionEvent.obtain(event)
+                    cancel.action = MotionEvent.ACTION_CANCEL
+                    gd.onTouchEvent(cancel)
+                    cancel.recycle()
+                    haptic()
+                    host.pullStart(event.rawX, event.rawY)
+                } else if (dx > dp(14f) || dy < -dp(14f)) {
+                    pullPossible = false
+                }
+            }
+        }
+        if (pulling) {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_MOVE -> host.pullMove(event.rawX, event.rawY)
+                MotionEvent.ACTION_UP -> {
+                    pulling = false
+                    val launched = host.pullEnd(event.rawX, event.rawY)
+                    // a short pull still opens the big view like before
+                    if (!launched && event.rawY - downY > dp(30f)) expand()
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    pulling = false
+                    host.pullEnd(downX, downY)
+                }
+            }
+            return true
         }
         return gd.onTouchEvent(event)
     }

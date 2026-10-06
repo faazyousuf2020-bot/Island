@@ -23,6 +23,7 @@ import android.os.SystemClock
 import kotlin.math.abs
 import kotlin.math.sqrt
 import android.graphics.Rect
+import android.graphics.RectF
 import android.util.DisplayMetrics
 import kotlin.math.max
 import android.hardware.camera2.CameraCharacteristics
@@ -43,7 +44,7 @@ import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 
-class IslandService : AccessibilityService(), IslandView.Host {
+class IslandService : AccessibilityService(), IslandView.Host, DodgeView.Host {
 
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var wm: WindowManager
@@ -127,6 +128,8 @@ class IslandService : AccessibilityService(), IslandView.Host {
         controller?.unregisterCallback(mcCallback)
         try { sm.unregisterListener(accel) } catch (e: Exception) {}
         releaseViz()
+        dodge?.let { try { wm.removeView(it) } catch (e: Exception) {} }
+        dodge = null
         try { wm.removeView(view) } catch (e: Exception) {}
         super.onDestroy()
     }
@@ -138,8 +141,8 @@ class IslandService : AccessibilityService(), IslandView.Host {
 
     // ---------------- settings ----------------
 
-    private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
-        if (ready) applyPrefs(true)
+    private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (ready && key != Prefs.DODGE_BEST) applyPrefs(true)
     }
 
     private fun applyPrefs(update: Boolean) {
@@ -180,6 +183,7 @@ class IslandService : AccessibilityService(), IslandView.Host {
         notifOn = prefs.getBoolean(Prefs.NOTIF, true)
         chargeOn = prefs.getBoolean(Prefs.CHARGE, true)
         val landscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        if (landscape) dodge?.kill()
         view.visibility = if (prefs.getBoolean(Prefs.ON, true) && !landscape) View.VISIBLE else View.GONE
         if (update && view.isAttachedToWindow) {
             try { wm.updateViewLayout(view, lp) } catch (e: Exception) {}
@@ -222,6 +226,10 @@ class IslandService : AccessibilityService(), IslandView.Host {
                 } catch (e: Exception) {}
             }
             Action.OPEN_ALERT -> openAlert(alert)
+            Action.GAME -> {
+                view.collapse()
+                openDodge()?.launchFromPill()
+            }
         }
         view.invalidate()
     }
@@ -296,6 +304,7 @@ class IslandService : AccessibilityService(), IslandView.Host {
     private val screenRx = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
             screenOff = i.action == Intent.ACTION_SCREEN_OFF
+            if (screenOff) dodge?.kill()
             if (!screenOff) view.lastMove = SystemClock.uptimeMillis()
             view.paused = screenOff
             updateSensors()
@@ -579,5 +588,82 @@ class IslandService : AccessibilityService(), IslandView.Host {
         } catch (e: Throwable) {
             fallback
         }
+    }
+
+    // ---------------- pull & dodge game ----------------
+
+    private var dodge: DodgeView? = null
+    private var dodgeLp: WindowManager.LayoutParams? = null
+
+    private fun pillRect(): RectF {
+        val cx = realScreenWidth() / 2f + lp.x
+        return RectF(cx - view.baseW / 2f, lp.y.toFloat(), cx + view.baseW / 2f, lp.y + view.baseH)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun openDodge(): DodgeView? {
+        dodge?.let { return it }
+        if (!ready) return null
+        val dm = DisplayMetrics()
+        wm.defaultDisplay.getRealMetrics(dm)
+        val p = WindowManager.LayoutParams(
+            dm.widthPixels, dm.heightPixels,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                    WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = 0
+            y = 0
+            if (Build.VERSION.SDK_INT >= 30) {
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+            } else if (Build.VERSION.SDK_INT >= 28) {
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
+        val v = DodgeView(this, this)
+        v.best = prefs.getInt(Prefs.DODGE_BEST, 0)
+        v.setPill(pillRect())
+        return try {
+            wm.addView(v, p)
+            dodge = v
+            dodgeLp = p
+            v
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    override fun pullStart(x: Float, y: Float) {
+        openDodge()?.startPull(x, y)
+    }
+
+    override fun pullMove(x: Float, y: Float) {
+        dodge?.movePull(x, y)
+    }
+
+    override fun pullEnd(x: Float, y: Float): Boolean = dodge?.endPull(x, y) ?: false
+
+    override fun onDodgeClosed() {
+        val v = dodge ?: return
+        dodge = null
+        dodgeLp = null
+        try { wm.removeView(v) } catch (e: Exception) {}
+    }
+
+    override fun onDodgeBest(best: Int) {
+        prefs.edit().putInt(Prefs.DODGE_BEST, best).apply()
+    }
+
+    override fun setDodgeTouchable(touchable: Boolean) {
+        val v = dodge ?: return
+        val p = dodgeLp ?: return
+        p.flags = if (touchable) p.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+        else p.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        try { wm.updateViewLayout(v, p) } catch (e: Exception) {}
     }
 }

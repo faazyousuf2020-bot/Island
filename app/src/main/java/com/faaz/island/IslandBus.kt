@@ -24,6 +24,7 @@ object Prefs {
     const val CAMRING = "camring"
     const val GLOW = "glow"
     const val PERM_TS = "perm_ts"
+    const val DODGE_BEST = "dodge_best"
 }
 
 fun Drawable.toBmp(size: Int): Bitmap {
